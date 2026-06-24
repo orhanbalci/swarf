@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Backup files from rustfmt
+**/*.rs.bk
+
+# Library crate: Cargo.lock is not committed by convention.
+# Remove this line if you add a binary/workspace member that needs a locked build.
+Cargo.lock
