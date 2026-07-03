@@ -11,11 +11,12 @@
 //!     manufacturers (Haas, Fanuc, Mazak, etc.)" - i.e. this is the
 //!     genuinely standard classification, not one interpreter's quirk.
 //!
-//! NOTE ON SCOPE: this enumerates the groups relevant to MOTION (per our
-//! explicit decision to scope Interface 1 to motion-relevant state, not
-//! the full machine state - spindle/coolant/tool-table groups are
-//! tracked here only enough to detect line-level conflicts; their actual
-//! *effects* are out of scope for this crate, which only resolves motion).
+//! NOTE ON SCOPE: this module only classifies codes into their modal
+//! group for line-level conflict detection (`ModalGroupSet`) - it does
+//! not implement any code's behavior. That resolution (spindle/coolant/
+//! tool-change effects, canned cycles, work offsets, and so on) lives in
+//! `visitor.rs`; see its and `lib.rs`'s module docs for what's actually
+//! implemented versus classified-but-inert.
 
 /// Which modal group a given G or M code belongs to. Two codes from the
 /// SAME group may not appear on the same line (NIST: "a line may have
@@ -45,8 +46,8 @@ pub enum ModalGroup {
     Units,
     /// G54-G59(.x) - coordinate system selection (work offset).
     CoordinateSystem,
-    /// G98, G99 - canned cycle return mode. Tracked for conflict
-    /// detection; canned cycles themselves are out of scope for now.
+    /// G98, G99 - canned cycle return mode (retract to the higher of
+    /// the R plane and the pre-cycle Z, or always just to R).
     CannedCycleReturnMode,
     /// M0, M1, M2, M30 - program stopping.
     ProgramStopping,
@@ -148,6 +149,12 @@ pub fn classify_general_code(major: u32, minor: Option<u32>) -> Option<ModalGrou
         (3, None) => Motion, // CCW arc
         (38, Some(2)) | (38, Some(3)) | (38, Some(4)) | (38, Some(5)) => Motion, // probing
         (80, None) => Motion, // cancel motion mode
+        (81, None) => Motion, // straight drill
+        (82, None) => Motion, // drill with dwell
+        (83, None) => Motion, // peck drill
+        (85, None) => Motion, // bore, feed out
+        (86, None) => Motion, // bore, spindle stop, rapid out
+        (89, None) => Motion, // bore with dwell, feed out
 
         // --- Plane selection (Group 2) ---
         (17, None) => Plane,
@@ -250,9 +257,9 @@ mod tests {
 
     #[test]
     fn unrecognized_g_code_returns_none_not_panic() {
-        // G81 (canned drill cycle) is real G-code but out of this
+        // G73 (high-speed peck drilling) is real G-code but out of this
         // crate's current scope - must return None, not panic or guess.
-        assert_eq!(classify_general_code(81, None), None);
+        assert_eq!(classify_general_code(73, None), None);
     }
 
     #[test]

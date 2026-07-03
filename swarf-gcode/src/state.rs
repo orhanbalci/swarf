@@ -195,6 +195,43 @@ pub struct ModalState {
     /// tool (T) and changing to it (M6) are two separate NIST actions.
     /// `None` until the first T word is ever seen.
     pub selected_tool: Option<u32>,
+
+    /// Sticky parameters for the canned drilling cycles (G81-G89) - see
+    /// `CannedCycleParams`.
+    pub canned_cycle: CannedCycleParams,
+
+    /// G98 (true, NIST default) / G99 (false): whether a canned cycle
+    /// retracts to the higher of the R plane and the position Z was at
+    /// before the cycle started (G98), or always just to the R plane
+    /// (G99, faster when the operator knows R already clears
+    /// everything).
+    pub canned_cycle_return_to_initial_z: bool,
+}
+
+/// Sticky parameters for the canned drilling cycles (G81-G89). NIST
+/// specifies these as modal in their own right, separate from the
+/// G8x motion mode itself: a canned-cycle line (or a bare axis-word
+/// repeat of one) that omits Z/R/Q/P reuses whichever value was last
+/// given. All distances are absolute machine-mm (already resolved
+/// through the active work offset and distance mode at the moment they
+/// were last given - see `Interpreter::execute_canned_cycle`), except
+/// `p` which is a plain duration in seconds. `None` until first given;
+/// consuming a `None` value where NIST requires one is
+/// `InterpretError::CannedCycleMissingParameter`, never a silent
+/// default - the same "no correctness footguns" principle as
+/// everywhere else in this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CannedCycleParams {
+    /// Final depth (the bottom of the hole).
+    pub z: Option<f64>,
+    /// Retract plane - rapid down to this before feeding, and the
+    /// default retract target after cutting.
+    pub r: Option<f64>,
+    /// Peck increment (G83 only).
+    pub q: Option<f64>,
+    /// Dwell duration in seconds at the bottom of the hole (G82/G89
+    /// only).
+    pub p: Option<f64>,
 }
 
 impl Default for ModalState {
@@ -213,6 +250,8 @@ impl Default for ModalState {
             feed_rate: 0.0,
             spindle_speed: 0.0,
             selected_tool: None,
+            canned_cycle: CannedCycleParams::default(),
+            canned_cycle_return_to_initial_z: true,
         }
     }
 }

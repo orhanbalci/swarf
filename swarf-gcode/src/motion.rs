@@ -33,6 +33,24 @@ pub enum MotionMode {
     ArcClockwise,
     /// G3 - counterclockwise arc at the active feed rate.
     ArcCounterclockwise,
+    /// G81 - straight drilling canned cycle: rapid to the R plane, feed
+    /// to the programmed depth, rapid retract.
+    Drill,
+    /// G82 - like `Drill`, but dwells at the bottom of the hole before
+    /// retracting.
+    DrillDwell,
+    /// G83 - peck drilling: feeds to depth in `Q`-sized increments,
+    /// fully retracting to the R plane between pecks to clear chips.
+    PeckDrill,
+    /// G85 - like `Drill`, but retracts at the active feed rate rather
+    /// than rapid (boring, so the tool doesn't spring on the way out).
+    BoreFeedOut,
+    /// G86 - like `Drill`, but stops the spindle at the bottom of the
+    /// hole before rapid-retracting. Does not restart the spindle.
+    BoreSpindleStop,
+    /// G89 - `DrillDwell` and `BoreFeedOut` combined: dwells at the
+    /// bottom, then retracts at the active feed rate.
+    BoreDwellFeedOut,
     /// G80 - motion mode cancelled; no motion mode is active. A bare
     /// axis-word line in this state is an error, not a silent no-op -
     /// see NIST's "cancel modal motion" semantics.

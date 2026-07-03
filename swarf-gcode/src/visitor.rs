@@ -1,29 +1,52 @@
-//! The interpreter itself, built directly against `gcode` 0.7's `core`
+//! The interpreter itself, built against `gcode` 0.7's `core`
 //! zero-allocation visitor API (`ProgramVisitor` / `BlockVisitor` /
-//! `CommandVisitor`) - the architecture this crate originally targeted
-//! before a toolchain gap (0.7 requires rust-version 1.85 / edition
-//! 2024) forced a temporary fallback to 0.6's flat iterator API. That
-//! gap is closed, so this module now matches `lib.rs`'s module docs
-//! directly: three borrow levels, each holding a mutable borrow back
-//! into the one real state owner (`ModalState`).
+//! `CommandVisitor`) - see `lib.rs`'s module docs for why this API was
+//! chosen over the higher-level, allocating `gcode::parse()`.
 //!
-//! Unlike the 0.6-based version this replaces, there is no parser bug
-//! to work around here: `core::parse` gives us exactly one
-//! `BlockVisitor::end_line` call per source line, bare axis words with
-//! no G/M/T word on their own line arrive via `BlockVisitor::word_address`,
-//! and each command's own arguments arrive scoped to that command via
-//! its own `CommandVisitor`. We still pool all axis data (`word_address`
-//! and every command's `argument`) into one shared per-line accumulator
-//! on `BlockCtx`, because NIST semantics treat a line's axis words as
-//! one pool that applies to whichever motion mode is active for that
-//! line - not as data belonging to whichever G-word happens to precede
-//! it syntactically (e.g. "G1 G91 X10": X is the line's target, not
+//! # Structure
+//!
+//! Three borrow levels, each holding a mutable borrow back into the one
+//! real state owner (`ModalState`):
+//!
+//!   - `Interpreter` (impl `ProgramVisitor`) owns `ModalState` and the
+//!     three output sinks (`MotionSink`, `CommandSink`, `ErrorSink`);
+//!     persists across the whole parse.
+//!   - `BlockCtx<'a>` (impl `BlockVisitor`) is per-line scratch: which
+//!     axis/word values were seen, which modal groups were touched this
+//!     line (for conflict detection), which non-motion effects were
+//!     requested. Borrows `&'a mut Interpreter`.
+//!   - `CommandCtx<'a, 'b>` (impl `CommandVisitor`) is per-command
+//!     scratch for a G/M/T word's own arguments (e.g. the `X10 Y20`
+//!     following a `G1`); shares the SAME pending-word accumulator as
+//!     its parent `BlockCtx` rather than keeping its own.
+//!
+//! This mirrors `core::parse`'s call order: a block produces zero or
+//! more commands, each command receives zero or more arguments via
+//! `argument`, then `end_command` returns control to the block; after
+//! all commands, `end_line` returns control to the program and is where
+//! a fully resolved line turns into output.
+//!
+//! # Why axis words are pooled at the block level
+//!
+//! Bare axis words with no G/M/T word on their own line arrive via
+//! `BlockVisitor::word_address`; a command's own arguments arrive via
+//! `CommandVisitor::argument`, scoped to that command. Both are pooled
+//! into the SAME shared fields on `BlockCtx` (not kept separate),
+//! because NIST semantics treat a line's axis words as one pool that
+//! applies to whichever motion mode is active for that line - not as
+//! data belonging to whichever G-word happens to precede it
+//! syntactically (e.g. `"G1 G91 X10"`: X is the line's target, not
 //! specifically G91's argument).
 //!
-//! Non-motion effects (spindle, coolant, tool change, dwell, program
-//! flow) are resolved the same way, into `Command` (Interface 3,
-//! `command.rs`) instead of `ResolvedMotionCommand` - see that module's
-//! docs for why they're a separate sink rather than folded in.
+//! # Non-motion output
+//!
+//! Spindle, coolant, tool change, dwell, and program-flow effects are
+//! resolved the same way as motion, but pushed to `CommandSink` as a
+//! `Command` (Interface 3, `command.rs`) instead of a
+//! `ResolvedMotionCommand` - see that module's docs for why they're a
+//! separate sink rather than folded into the motion stream.
+//!
+//! # Allocation
 //!
 //! This module (and the crate as a whole) is allocation-free: `gcode`
 //! 0.7's `core` module has no `alloc` dependency, and neither do we -
@@ -60,6 +83,18 @@ pub enum InterpretError {
     /// A G2/G3 line's I/J/K/R data could not be turned into a valid arc
     /// - see `motion::ArcError` for the specific reason.
     InvalidArc(ArcError),
+    /// A canned cycle (G81-G89) needed its Z (depth), R (retract plane),
+    /// or P (dwell, G82/G89 only) value, and none was ever given. These
+    /// are sticky (see `state::CannedCycleParams`) but still require a
+    /// first value before a cycle can run.
+    CannedCycleMissingParameter,
+    /// G83 (peck drilling) requires a positive Q (peck increment); one
+    /// was missing, zero, or negative.
+    InvalidPeckIncrement,
+    /// A canned cycle (G81-G89) was invoked while G18 or G19 was the
+    /// active plane. Only G17 (XY, Z as the drilling axis) is
+    /// implemented - real scope decision, see `lib.rs` module docs.
+    UnsupportedCannedCyclePlane,
     /// A `#...` parameter reference or expression appeared as a
     /// `Value::Variable` rather than a literal. This crate does not
     /// evaluate parameters/expressions (see `lib.rs` module docs).
@@ -81,6 +116,20 @@ pub enum InterpretError {
 enum HomeReference {
     G28,
     G30,
+}
+
+/// The words a canned-cycle line (G81-G89) can carry, bundled into one
+/// value so `execute_canned_cycle` takes a reasonable number of
+/// arguments. Mirrors the relevant subset of `BlockCtx`'s per-line
+/// scratch fields.
+#[derive(Debug, Clone, Copy, Default)]
+struct CannedCycleWords {
+    x: Option<f32>,
+    y: Option<f32>,
+    z: Option<f32>,
+    r: Option<f32>,
+    q: Option<f32>,
+    p: Option<f32>,
 }
 
 /// Sink for fully resolved motion commands.
@@ -129,6 +178,19 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
         (self.sink, self.commands, self.errors)
     }
 
+    /// Resolve one axis word against `current` (the position to fall
+    /// back to when no word was given) and `offset` (the active work/G92
+    /// offset for that axis), honoring G90/G91. The building block both
+    /// `resolve_target_from_values` and the canned-cycle machinery
+    /// (`execute_canned_cycle`) use for every axis they touch.
+    fn resolve_axis_word(&self, current: f64, offset: f64, word: Option<f32>) -> f64 {
+        match (word, self.state.distance_mode) {
+            (Some(v), DistanceMode::Absolute) => self.state.to_mm(v as f64) + offset,
+            (Some(v), DistanceMode::Incremental) => current + self.state.to_mm(v as f64),
+            (None, _) => current,
+        }
+    }
+
     /// Resolve a line's X/Y/Z words into an absolute target.
     ///
     /// `machine_coordinates` is G53's line-local override: when true,
@@ -154,11 +216,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
                     None => current,
                 };
             }
-            match (word, self.state.distance_mode) {
-                (Some(v), DistanceMode::Absolute) => self.state.to_mm(v as f64) + offset,
-                (Some(v), DistanceMode::Incremental) => current + self.state.to_mm(v as f64),
-                (None, _) => current,
-            }
+            self.resolve_axis_word(current, offset, word)
         };
 
         Position {
@@ -166,6 +224,199 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
             y: combine(self.state.position.y, offset.y, y),
             z: combine(self.state.position.z, offset.z, z),
         }
+    }
+
+    /// Push a rapid move from `start` to `target` at the active feed
+    /// rate field (meaningless for rapids, kept for
+    /// `ResolvedMotionCommand` field uniformity - see its docs).
+    fn push_rapid(&mut self, start: Position, target: Position) {
+        let _ = self.sink.push(ResolvedMotionCommand {
+            start,
+            target,
+            motion_mode: MotionMode::Rapid,
+            arc: None,
+            feed_rate: self.state.feed_rate,
+        });
+    }
+
+    /// Push a linear (feed-rate-coordinated) move from `start` to
+    /// `target`.
+    fn push_linear(&mut self, start: Position, target: Position) {
+        let _ = self.sink.push(ResolvedMotionCommand {
+            start,
+            target,
+            motion_mode: MotionMode::Linear,
+            arc: None,
+            feed_rate: self.state.feed_rate,
+        });
+    }
+
+    /// Execute one canned-cycle hole: resolve the hole's X/Y and the
+    /// (sticky) Z/R/Q/P parameters, then push the rapid/feed/rapid (or
+    /// feed, for G85/G89's retract) legs described by `kind`. See
+    /// `motion::MotionMode`'s canned-cycle variants and `state`'s
+    /// `CannedCycleParams` docs for what each parameter means.
+    ///
+    /// Scope: only the G17 (XY) plane is supported - Z is always the
+    /// drilling axis. L (repeat count) is not implemented; each line
+    /// drills exactly one hole. See `lib.rs` module docs.
+    fn execute_canned_cycle(
+        &mut self,
+        kind: MotionMode,
+        words: CannedCycleWords,
+    ) -> Result<(), InterpretError> {
+        if self.state.plane != Plane::Xy {
+            return Err(InterpretError::UnsupportedCannedCyclePlane);
+        }
+
+        let start = self.state.position;
+        let offset = self.state.active_offset();
+
+        let hole_x = self.resolve_axis_word(start.x, offset.x, words.x);
+        let hole_y = self.resolve_axis_word(start.y, offset.y, words.y);
+
+        if let Some(z) = words.z {
+            self.state.canned_cycle.z = Some(self.resolve_axis_word(start.z, offset.z, Some(z)));
+        }
+        let target_z = self
+            .state
+            .canned_cycle
+            .z
+            .ok_or(InterpretError::CannedCycleMissingParameter)?;
+
+        if let Some(r) = words.r {
+            self.state.canned_cycle.r = Some(self.resolve_axis_word(start.z, offset.z, Some(r)));
+        }
+        let r_plane = self
+            .state
+            .canned_cycle
+            .r
+            .ok_or(InterpretError::CannedCycleMissingParameter)?;
+
+        if let Some(q) = words.q {
+            self.state.canned_cycle.q = Some(self.state.to_mm(q as f64));
+        }
+        if let Some(p) = words.p {
+            self.state.canned_cycle.p = Some(p as f64);
+        }
+
+        // Validate everything this cycle needs BEFORE pushing any
+        // motion, so a bad line (e.g. G83 with no valid Q) produces no
+        // partial output - consistent with how an invalid arc (see
+        // `resolve_arc_center`) never emits a half-resolved move either.
+        let peck_q = if matches!(kind, MotionMode::PeckDrill) {
+            Some(
+                self.state
+                    .canned_cycle
+                    .q
+                    .filter(|q| *q > 0.0)
+                    .ok_or(InterpretError::InvalidPeckIncrement)?,
+            )
+        } else {
+            None
+        };
+        if matches!(kind, MotionMode::DrillDwell | MotionMode::BoreDwellFeedOut)
+            && self.state.canned_cycle.p.is_none()
+        {
+            return Err(InterpretError::CannedCycleMissingParameter);
+        }
+
+        // Step 1: rapid to the hole's X/Y at the current Z.
+        let mut pos = start;
+        let above_hole = Position {
+            x: hole_x,
+            y: hole_y,
+            z: pos.z,
+        };
+        self.push_rapid(pos, above_hole);
+        pos = above_hole;
+
+        // Step 2: rapid down (or up) to the retract plane.
+        let at_r = Position {
+            x: hole_x,
+            y: hole_y,
+            z: r_plane,
+        };
+        self.push_rapid(pos, at_r);
+        pos = at_r;
+
+        // +1 if drilling moves Z upward from R to the target, -1 if
+        // downward - keeps the peck loop and the G98 "higher of the
+        // two" comparison below sign-agnostic.
+        let sign: f64 = if target_z >= r_plane { 1.0 } else { -1.0 };
+
+        // Step 3: cut to the bottom. Peck drilling repeats this in
+        // `q`-sized bites with a full retract to R between each (to
+        // clear chips); every other cycle cuts in a single pass.
+        if let Some(q) = peck_q {
+            let total_depth = (target_z - r_plane).abs();
+            let mut travelled = 0.0;
+            loop {
+                travelled = (travelled + q).min(total_depth);
+                let this_bottom = Position {
+                    x: hole_x,
+                    y: hole_y,
+                    z: r_plane + sign * travelled,
+                };
+                self.push_linear(pos, this_bottom);
+                pos = this_bottom;
+                if travelled >= total_depth {
+                    break;
+                }
+                self.push_rapid(pos, at_r);
+                pos = at_r;
+            }
+        } else {
+            let bottom = Position {
+                x: hole_x,
+                y: hole_y,
+                z: target_z,
+            };
+            self.push_linear(pos, bottom);
+            pos = bottom;
+        }
+
+        // Step 4: action at the bottom of the hole, if any.
+        match kind {
+            MotionMode::DrillDwell | MotionMode::BoreDwellFeedOut => {
+                let seconds = self
+                    .state
+                    .canned_cycle
+                    .p
+                    .ok_or(InterpretError::CannedCycleMissingParameter)?;
+                let _ = self.commands.push(Command::Dwell { seconds });
+            }
+            MotionMode::BoreSpindleStop => {
+                let _ = self.commands.push(Command::Spindle(SpindleCommand::Stop));
+            }
+            _ => {}
+        }
+
+        // Step 5: retract - to R (G99), or the higher of R and the
+        // pre-cycle Z (G98, NIST default); at the active feed rate for
+        // G85/G89 (boring), rapid otherwise.
+        let away_from_bottom = |v: f64| -sign * (v - target_z);
+        let retract_z = if self.state.canned_cycle_return_to_initial_z
+            && away_from_bottom(start.z) > away_from_bottom(r_plane)
+        {
+            start.z
+        } else {
+            r_plane
+        };
+        let retracted = Position {
+            x: hole_x,
+            y: hole_y,
+            z: retract_z,
+        };
+        if matches!(kind, MotionMode::BoreFeedOut | MotionMode::BoreDwellFeedOut) {
+            self.push_linear(pos, retracted);
+        } else {
+            self.push_rapid(pos, retracted);
+        }
+        self.state.position = retracted;
+        self.state.motion_mode = kind;
+
+        Ok(())
     }
 }
 
@@ -206,6 +457,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> ProgramVisitor for Interpreter
             j: None,
             k: None,
             r: None,
+            q: None,
             dwell_requested: false,
             program_flow: None,
             spindle_word: None,
@@ -246,8 +498,12 @@ struct BlockCtx<'a, M: MotionSink, C: CommandSink, E: ErrorSink> {
     i: Option<f32>,
     j: Option<f32>,
     k: Option<f32>,
-    /// R word - arc radius (G2/G3 radius form).
+    /// R word - arc radius (G2/G3 radius form) or canned-cycle retract
+    /// plane - unambiguous since a line's motion mode is exactly one of
+    /// the two, never both.
     r: Option<f32>,
+    /// Q word - canned-cycle peck increment (G83 only).
+    q: Option<f32>,
     dwell_requested: bool,
     /// Major number of an M0/M1/M2/M30 word seen this line, if any.
     program_flow: Option<u32>,
@@ -304,6 +560,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockCtx<'_, M, C, E> {
             'J' => self.j = Some(v),
             'K' => self.k = Some(v),
             'R' => self.r = Some(v),
+            'Q' => self.q = Some(v),
             _ => {}
         }
     }
@@ -347,6 +604,12 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                     (1, None) => MotionMode::Linear,
                     (2, None) => MotionMode::ArcClockwise,
                     (3, None) => MotionMode::ArcCounterclockwise,
+                    (81, None) => MotionMode::Drill,
+                    (82, None) => MotionMode::DrillDwell,
+                    (83, None) => MotionMode::PeckDrill,
+                    (85, None) => MotionMode::BoreFeedOut,
+                    (86, None) => MotionMode::BoreSpindleStop,
+                    (89, None) => MotionMode::BoreDwellFeedOut,
                     _ => MotionMode::None, // G38.x probing, G80 cancel
                 });
             }
@@ -424,6 +687,10 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                     self.interp.state.coordinate_system = cs;
                 }
             }
+            Some(ModalGroup::CannedCycleReturnMode) => {
+                self.classify_and_record_group(ModalGroup::CannedCycleReturnMode);
+                self.interp.state.canned_cycle_return_to_initial_z = major == 98;
+            }
             Some(group) => self.classify_and_record_group(group),
             None => {}
         }
@@ -461,9 +728,24 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
             effective_mode,
             MotionMode::ArcClockwise | MotionMode::ArcCounterclockwise
         );
+        let is_canned_cycle = matches!(
+            effective_mode,
+            MotionMode::Drill
+                | MotionMode::DrillDwell
+                | MotionMode::PeckDrill
+                | MotionMode::BoreFeedOut
+                | MotionMode::BoreSpindleStop
+                | MotionMode::BoreDwellFeedOut
+        );
         let has_axis_word = self.x.is_some() || self.y.is_some() || self.z.is_some();
         let has_arc_geometry =
             self.i.is_some() || self.j.is_some() || self.k.is_some() || self.r.is_some();
+        // A canned cycle can be (re)triggered by a G8x word alone, with
+        // no new axis words at all (e.g. "G81 R2 F100" re-drilling the
+        // current X/Y at a new retract height) - unlike ordinary motion
+        // codes, where a bare G-word with no axis data never produces a
+        // move.
+        let fresh_canned_cycle_word = is_canned_cycle && self.resolved_mode.is_some();
         // A full-circle arc (G2/G3 I.. J.. with no X/Y/Z) has no axis
         // words at all - target defaults to start, which
         // `resolve_target_from_values` already does for omitted words -
@@ -474,8 +756,8 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
         // aren't a motion target for the STANDARD resolution below - a
         // home move (G28/G30) still produces real motion, just through
         // its own dedicated handling further down in this function.
-        let has_motion_data =
-            !self.suppress_motion && (has_axis_word || (is_arc && has_arc_geometry));
+        let has_motion_data = !self.suppress_motion
+            && (has_axis_word || (is_arc && has_arc_geometry) || fresh_canned_cycle_word);
 
         if !has_motion_data {
             // No axis data on this line: either a bare modal-mode word
@@ -487,6 +769,18 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
             }
         } else if effective_mode == MotionMode::None {
             self.interp.errors.push(InterpretError::NoActiveMotionMode);
+        } else if is_canned_cycle {
+            let words = CannedCycleWords {
+                x: self.x,
+                y: self.y,
+                z: self.z,
+                r: self.r,
+                q: self.q,
+                p: self.p,
+            };
+            if let Err(e) = self.interp.execute_canned_cycle(effective_mode, words) {
+                self.interp.errors.push(e);
+            }
         } else {
             let start = self.interp.state.position;
             let target = self.interp.resolve_target_from_values(
@@ -1281,5 +1575,191 @@ mod tests {
         // G53's X5 is an absolute machine coordinate even though G91
         // (incremental) is active.
         assert_eq!(sink.commands[1].target.x, 5.0);
+    }
+
+    #[test]
+    fn g81_drills_a_hole_with_rapid_legs_and_default_g98_retract() {
+        // Starting Z (0) is below R (2), so G98's default retracts to R
+        // (the higher of the two) - see the dedicated G98/G99 tests
+        // below for a case where they actually differ.
+        let (sink, _, errors) = run("G81 X5 Y5 Z-10 R2 F100\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 4);
+        assert_eq!(sink.commands[0].motion_mode, MotionMode::Rapid);
+        assert_eq!(
+            sink.commands[0].target,
+            Position {
+                x: 5.0,
+                y: 5.0,
+                z: 0.0
+            }
+        );
+        assert_eq!(sink.commands[1].motion_mode, MotionMode::Rapid);
+        assert_eq!(
+            sink.commands[1].target,
+            Position {
+                x: 5.0,
+                y: 5.0,
+                z: 2.0
+            }
+        );
+        assert_eq!(sink.commands[2].motion_mode, MotionMode::Linear);
+        assert_eq!(
+            sink.commands[2].target,
+            Position {
+                x: 5.0,
+                y: 5.0,
+                z: -10.0
+            }
+        );
+        assert_eq!(sink.commands[3].motion_mode, MotionMode::Rapid);
+        assert_eq!(
+            sink.commands[3].target,
+            Position {
+                x: 5.0,
+                y: 5.0,
+                z: 2.0
+            }
+        );
+    }
+
+    #[test]
+    fn g81_g98_retracts_to_initial_z_when_higher_than_r() {
+        let (sink, _, errors) = run("G0 Z5\nG81 X0 Y0 Z-10 R2 F100\n");
+        assert!(errors.errors.is_empty());
+        // Initial Z (5) is higher than R (2), so G98 (the default)
+        // retracts all the way back to the initial Z, not just to R.
+        assert_eq!(sink.commands.last().unwrap().target.z, 5.0);
+    }
+
+    #[test]
+    fn g99_always_retracts_to_r_even_when_lower_than_initial_z() {
+        let (sink, _, errors) = run("G0 Z5\nG99 G81 X0 Y0 Z-10 R2 F100\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.last().unwrap().target.z, 2.0);
+    }
+
+    #[test]
+    fn bare_axis_words_repeat_the_canned_cycle_with_sticky_z_and_r() {
+        let (sink, _, errors) = run("G81 X0 Y0 Z-5 R2 F100\nX10 Y0\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 8);
+        // Second hole's cut still goes to Z-5 - Z/R were not repeated
+        // on the second line but are sticky.
+        assert_eq!(
+            sink.commands[6].target,
+            Position {
+                x: 10.0,
+                y: 0.0,
+                z: -5.0
+            }
+        );
+    }
+
+    #[test]
+    fn g82_dwells_at_the_bottom_of_the_hole() {
+        let (sink, commands, errors) = run("G82 X0 Y0 Z-5 R2 P0.5 F100\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 4);
+        assert_eq!(
+            commands.commands,
+            std::vec![Command::Dwell { seconds: 0.5 }]
+        );
+    }
+
+    #[test]
+    fn g82_without_p_and_no_prior_value_is_a_missing_parameter_error() {
+        let (sink, _, errors) = run("G82 X0 Y0 Z-5 R2 F100\n");
+        assert!(sink.commands.is_empty());
+        assert!(errors
+            .errors
+            .contains(&InterpretError::CannedCycleMissingParameter));
+    }
+
+    #[test]
+    fn g83_pecks_in_q_sized_bites_with_full_retracts_between() {
+        // R=2, target Z=-10: total depth 12, in bites of 3 - four
+        // pecks (3,6,9,12=full depth), three intermediate retracts.
+        let (sink, _, errors) = run("G83 X0 Y0 Z-10 R2 Q3 F100\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 10);
+        assert_eq!(sink.commands[2].target.z, -1.0);
+        assert_eq!(sink.commands[3].target.z, 2.0);
+        assert_eq!(sink.commands[4].target.z, -4.0);
+        assert_eq!(sink.commands[5].target.z, 2.0);
+        assert_eq!(sink.commands[6].target.z, -7.0);
+        assert_eq!(sink.commands[7].target.z, 2.0);
+        // Final peck reaches the full programmed depth exactly.
+        assert_eq!(sink.commands[8].target.z, -10.0);
+        assert_eq!(sink.commands[8].motion_mode, MotionMode::Linear);
+    }
+
+    #[test]
+    fn g83_without_a_positive_q_is_an_error_with_no_partial_output() {
+        let (sink, _, errors) = run("G83 X0 Y0 Z-10 R2 F100\n");
+        assert!(sink.commands.is_empty());
+        assert!(errors
+            .errors
+            .contains(&InterpretError::InvalidPeckIncrement));
+    }
+
+    #[test]
+    fn g85_retracts_at_feed_rate_instead_of_rapid() {
+        let (sink, _, errors) = run("G85 X0 Y0 Z-5 R2 F100\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(
+            sink.commands.last().unwrap().motion_mode,
+            MotionMode::Linear
+        );
+    }
+
+    #[test]
+    fn g86_stops_the_spindle_at_the_bottom_and_rapid_retracts() {
+        let (sink, commands, errors) = run("G86 X0 Y0 Z-5 R2 F100\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.last().unwrap().motion_mode, MotionMode::Rapid);
+        assert_eq!(
+            commands.commands,
+            std::vec![Command::Spindle(SpindleCommand::Stop)]
+        );
+    }
+
+    #[test]
+    fn g89_dwells_then_retracts_at_feed_rate() {
+        let (sink, commands, errors) = run("G89 X0 Y0 Z-5 R2 P0.25 F100\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(
+            sink.commands.last().unwrap().motion_mode,
+            MotionMode::Linear
+        );
+        assert_eq!(
+            commands.commands,
+            std::vec![Command::Dwell { seconds: 0.25 }]
+        );
+    }
+
+    #[test]
+    fn canned_cycle_without_z_or_r_is_a_missing_parameter_error() {
+        let (sink, _, errors) = run("G81 X0 Y0 F100\n");
+        assert!(sink.commands.is_empty());
+        assert!(errors
+            .errors
+            .contains(&InterpretError::CannedCycleMissingParameter));
+    }
+
+    #[test]
+    fn canned_cycle_in_a_non_xy_plane_is_unsupported() {
+        let (sink, _, errors) = run("G18\nG81 X0 Y0 Z-5 R2 F100\n");
+        assert!(sink.commands.is_empty());
+        assert!(errors
+            .errors
+            .contains(&InterpretError::UnsupportedCannedCyclePlane));
+    }
+
+    #[test]
+    fn g80_cancels_a_canned_cycle() {
+        let (sink, _, errors) = run("G81 X0 Y0 Z-5 R2 F100\nG80\nX10\n");
+        assert!(sink.commands.len() == 4);
+        assert!(errors.errors.contains(&InterpretError::NoActiveMotionMode));
     }
 }
