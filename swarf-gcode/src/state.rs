@@ -169,6 +169,18 @@ pub struct ModalState {
     /// real scope decision, see `visitor` module docs.
     pub g92_offset: Position,
 
+    /// G28's stored reference position, in absolute machine
+    /// coordinates (no work/G92 offset applied) - what a bare "G28"
+    /// rapids to. This crate has no persistent settings storage, so the
+    /// host sets this directly (it's `pub`) from its own config, the
+    /// same way it populates `coordinate_system_offsets`; G28.1 also
+    /// updates it, from the current machine position.
+    pub g28_position: Position,
+
+    /// G30's stored reference position - same shape as `g28_position`,
+    /// set by the host or by G30.1, consulted by G30.
+    pub g30_position: Position,
+
     /// Feed rate in mm/min, already unit-converted regardless of the
     /// active Units mode at the time F was parsed.
     pub feed_rate: f64,
@@ -196,6 +208,8 @@ impl Default for ModalState {
             coordinate_system: CoordinateSystem::default(),
             coordinate_system_offsets: [Position::default(); CoordinateSystem::COUNT],
             g92_offset: Position::default(),
+            g28_position: Position::default(),
+            g30_position: Position::default(),
             feed_rate: 0.0,
             spindle_speed: 0.0,
             selected_tool: None,

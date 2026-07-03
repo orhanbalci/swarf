@@ -75,6 +75,14 @@ pub enum InterpretError {
     SyntaxError(Span),
 }
 
+/// Which stored reference position a G28/G30 (or G28.1/G30.1) line
+/// refers to - see `ModalState::g28_position` / `g30_position`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeReference {
+    G28,
+    G30,
+}
+
 /// Sink for fully resolved motion commands.
 pub trait MotionSink {
     fn push(&mut self, command: ResolvedMotionCommand) -> Result<(), ()>;
@@ -121,14 +129,31 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
         (self.sink, self.commands, self.errors)
     }
 
+    /// Resolve a line's X/Y/Z words into an absolute target.
+    ///
+    /// `machine_coordinates` is G53's line-local override: when true,
+    /// work/G92 offsets are ignored and every given word is read as an
+    /// absolute machine coordinate regardless of the active G90/G91
+    /// distance mode - both per NIST's definition of G53.
     fn resolve_target_from_values(
         &self,
         x: Option<f32>,
         y: Option<f32>,
         z: Option<f32>,
+        machine_coordinates: bool,
     ) -> Position {
-        let offset = self.state.active_offset();
+        let offset = if machine_coordinates {
+            Position::default()
+        } else {
+            self.state.active_offset()
+        };
         let combine = |current: f64, offset: f64, word: Option<f32>| -> f64 {
+            if machine_coordinates {
+                return match word {
+                    Some(v) => self.state.to_mm(v as f64),
+                    None => current,
+                };
+            }
             match (word, self.state.distance_mode) {
                 (Some(v), DistanceMode::Absolute) => self.state.to_mm(v as f64) + offset,
                 (Some(v), DistanceMode::Incremental) => current + self.state.to_mm(v as f64),
@@ -190,6 +215,9 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> ProgramVisitor for Interpreter
             suppress_motion: false,
             g92_requested: false,
             g92_cancel_requested: false,
+            home_request: None,
+            set_home_reference: None,
+            machine_coordinates: false,
         })
     }
 }
@@ -241,6 +269,15 @@ struct BlockCtx<'a, M: MotionSink, C: CommandSink, E: ErrorSink> {
     g92_requested: bool,
     /// G92.1 appeared: reset the G92 offset to zero.
     g92_cancel_requested: bool,
+    /// G28 or G30 appeared: rapid (via any given axis words as an
+    /// intermediate point) to the named stored reference position.
+    home_request: Option<HomeReference>,
+    /// G28.1 or G30.1 appeared: record the current machine position as
+    /// the named stored reference position.
+    set_home_reference: Option<HomeReference>,
+    /// G53 appeared: this line's axis words are absolute machine
+    /// coordinates, ignoring work/G92 offsets and G90/G91.
+    machine_coordinates: bool,
 }
 
 impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockCtx<'_, M, C, E> {
@@ -350,6 +387,23 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                         self.g92_cancel_requested = true;
                         self.suppress_motion = true;
                     }
+                    (28, None) => {
+                        self.home_request = Some(HomeReference::G28);
+                        self.suppress_motion = true;
+                    }
+                    (28, Some(1)) => {
+                        self.set_home_reference = Some(HomeReference::G28);
+                        self.suppress_motion = true;
+                    }
+                    (30, None) => {
+                        self.home_request = Some(HomeReference::G30);
+                        self.suppress_motion = true;
+                    }
+                    (30, Some(1)) => {
+                        self.set_home_reference = Some(HomeReference::G30);
+                        self.suppress_motion = true;
+                    }
+                    (53, None) => self.machine_coordinates = true,
                     _ => {}
                 }
             }
@@ -416,8 +470,10 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
         // but it's still a real move, so it must not be swallowed by
         // the "nothing to resolve" branch below. `suppress_motion` is
         // the opposite case: axis-shaped words ARE present, but this
-        // line's G-word (currently just G92/G92.1) means they aren't a
-        // motion target at all.
+        // line's G-word (G92/G92.1, G28/G30, G28.1/G30.1) means they
+        // aren't a motion target for the STANDARD resolution below - a
+        // home move (G28/G30) still produces real motion, just through
+        // its own dedicated handling further down in this function.
         let has_motion_data =
             !self.suppress_motion && (has_axis_word || (is_arc && has_arc_geometry));
 
@@ -433,9 +489,12 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
             self.interp.errors.push(InterpretError::NoActiveMotionMode);
         } else {
             let start = self.interp.state.position;
-            let target = self
-                .interp
-                .resolve_target_from_values(self.x, self.y, self.z);
+            let target = self.interp.resolve_target_from_values(
+                self.x,
+                self.y,
+                self.z,
+                self.machine_coordinates,
+            );
 
             let mut arc = None;
             let mut arc_failed = false;
@@ -565,6 +624,51 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
 
         if self.g92_cancel_requested {
             self.interp.state.g92_offset = Position::default();
+        }
+
+        if let Some(reference) = self.home_request {
+            // G28/G30: rapid through any given axis words as an
+            // intermediate point (normal work-offset resolution, same
+            // as any other move), then rapid on to the stored reference
+            // position (raw machine coordinates, per NIST). Neither
+            // move updates `motion_mode` - G28/G30 are non-modal and do
+            // not become the carried-forward mode for later lines.
+            let mut leg_start = self.interp.state.position;
+
+            if has_axis_word {
+                let intermediate = self
+                    .interp
+                    .resolve_target_from_values(self.x, self.y, self.z, false);
+                let _ = self.interp.sink.push(ResolvedMotionCommand {
+                    start: leg_start,
+                    target: intermediate,
+                    motion_mode: MotionMode::Rapid,
+                    arc: None,
+                    feed_rate: self.interp.state.feed_rate,
+                });
+                self.interp.state.position = intermediate;
+                leg_start = intermediate;
+            }
+
+            let reference_position = match reference {
+                HomeReference::G28 => self.interp.state.g28_position,
+                HomeReference::G30 => self.interp.state.g30_position,
+            };
+            let _ = self.interp.sink.push(ResolvedMotionCommand {
+                start: leg_start,
+                target: reference_position,
+                motion_mode: MotionMode::Rapid,
+                arc: None,
+                feed_rate: self.interp.state.feed_rate,
+            });
+            self.interp.state.position = reference_position;
+        }
+
+        if let Some(reference) = self.set_home_reference {
+            match reference {
+                HomeReference::G28 => self.interp.state.g28_position = self.interp.state.position,
+                HomeReference::G30 => self.interp.state.g30_position = self.interp.state.position,
+            }
         }
     }
 }
@@ -1031,6 +1135,151 @@ mod tests {
         assert!(errors.errors.is_empty());
         assert_eq!(sink.commands.len(), 2);
         // With the G92 shift cancelled, X5 is just X5 again.
+        assert_eq!(sink.commands[1].target.x, 5.0);
+    }
+
+    /// Like `run`, but lets a test configure `ModalState` (e.g. preload
+    /// a G28/G30 reference position, standing in for host-provided
+    /// settings) before parsing.
+    fn run_configured(
+        configure: impl FnOnce(&mut ModalState),
+        src: &str,
+    ) -> (CollectingSink, CollectingCommands, CollectingErrors) {
+        let mut interp = Interpreter::new(
+            CollectingSink::default(),
+            CollectingCommands::default(),
+            CollectingErrors::default(),
+        );
+        configure(&mut interp.state);
+        interp.run(src);
+        interp.into_sinks()
+    }
+
+    #[test]
+    fn g28_with_axis_words_moves_through_intermediate_point_then_home() {
+        let (sink, _, errors) = run_configured(
+            |state| {
+                state.g28_position = Position {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 50.0,
+                }
+            },
+            "G0 X10 Y0\nG28 Z20\n",
+        );
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 3);
+        // Intermediate leg: rapid to Z20, keeping X/Y from before.
+        let intermediate = sink.commands[1];
+        assert_eq!(intermediate.motion_mode, MotionMode::Rapid);
+        assert_eq!(intermediate.target.x, 10.0);
+        assert_eq!(intermediate.target.z, 20.0);
+        // Final leg: rapid from the intermediate point to the stored
+        // G28 reference position (raw machine coordinates).
+        let home = sink.commands[2];
+        assert_eq!(home.start, intermediate.target);
+        assert_eq!(home.target.x, 0.0);
+        assert_eq!(home.target.z, 50.0);
+    }
+
+    #[test]
+    fn g28_with_no_axis_words_goes_directly_to_reference() {
+        let (sink, _, errors) = run_configured(
+            |state| {
+                state.g28_position = Position {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                }
+            },
+            "G0 X10 Y0\nG28\n",
+        );
+        assert!(errors.errors.is_empty());
+        // Only two commands: the initial G0, then straight to home - no
+        // intermediate leg, since no axis words were given.
+        assert_eq!(sink.commands.len(), 2);
+        assert_eq!(
+            sink.commands[1].target,
+            Position {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0
+            }
+        );
+    }
+
+    #[test]
+    fn g28_does_not_change_the_carried_motion_mode() {
+        // G28/G30 are non-modal: a bare axis-word line afterward should
+        // still use G1 (carried from before the G28), not Rapid.
+        let (sink, _, errors) = run("G1 X10\nG28\nX20\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 3);
+        assert_eq!(sink.commands[2].motion_mode, MotionMode::Linear);
+    }
+
+    #[test]
+    fn g28_1_records_current_position_as_the_reference() {
+        let (sink, _, errors) = run("G0 X7 Y8 Z9\nG28.1\nG28\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 2);
+        assert_eq!(
+            sink.commands[1].target,
+            Position {
+                x: 7.0,
+                y: 8.0,
+                z: 9.0
+            }
+        );
+    }
+
+    #[test]
+    fn g30_uses_a_separate_reference_position_from_g28() {
+        let (sink, _, errors) = run_configured(
+            |state| {
+                state.g28_position = Position {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 0.0,
+                };
+                state.g30_position = Position {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 0.0,
+                };
+            },
+            "G30\n",
+        );
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands[0].target.x, 2.0);
+    }
+
+    #[test]
+    fn g53_ignores_work_offset_and_uses_machine_coordinates() {
+        let (sink, _, errors) = run_with_offsets(
+            &[(
+                CoordinateSystem::G54,
+                Position {
+                    x: 100.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+            )],
+            "G1 X10\nG53 G1 X10\n",
+        );
+        assert!(errors.errors.is_empty());
+        // Without G53: X10 programmed + 100 work offset = 110.
+        assert_eq!(sink.commands[0].target.x, 110.0);
+        // With G53: X10 is read as the literal machine coordinate.
+        assert_eq!(sink.commands[1].target.x, 10.0);
+    }
+
+    #[test]
+    fn g53_ignores_incremental_distance_mode() {
+        let (sink, _, errors) = run("G91 G1 X10\nG53 G1 X5\n");
+        assert!(errors.errors.is_empty());
+        // G53's X5 is an absolute machine coordinate even though G91
+        // (incremental) is active.
         assert_eq!(sink.commands[1].target.x, 5.0);
     }
 }
