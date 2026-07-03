@@ -57,6 +57,50 @@ impl Default for Units {
     }
 }
 
+/// A selectable work coordinate system (G54-G59.3). NIST defines nine of
+/// these; each carries its own offset, set by the host (see
+/// `ModalState::set_coordinate_system_offset`) since this crate has no
+/// persistent settings storage of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinateSystem {
+    /// G54 - NIST default active system at power-on.
+    G54,
+    G55,
+    G56,
+    G57,
+    G58,
+    G59,
+    G59_1,
+    G59_2,
+    G59_3,
+}
+
+impl CoordinateSystem {
+    /// How many systems exist - the size of the offset table backing
+    /// them (`ModalState`'s internal `coordinate_system_offsets`).
+    pub const COUNT: usize = 9;
+
+    const fn index(self) -> usize {
+        match self {
+            CoordinateSystem::G54 => 0,
+            CoordinateSystem::G55 => 1,
+            CoordinateSystem::G56 => 2,
+            CoordinateSystem::G57 => 3,
+            CoordinateSystem::G58 => 4,
+            CoordinateSystem::G59 => 5,
+            CoordinateSystem::G59_1 => 6,
+            CoordinateSystem::G59_2 => 7,
+            CoordinateSystem::G59_3 => 8,
+        }
+    }
+}
+
+impl Default for CoordinateSystem {
+    fn default() -> Self {
+        CoordinateSystem::G54
+    }
+}
+
 /// Distance mode (G90/G91): are axis words absolute positions or
 /// incremental deltas from the current position?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,16 +150,24 @@ pub struct ModalState {
     pub units: Units,
     pub distance_mode: DistanceMode,
 
-    /// Active work coordinate system offset (G54-G59.3), applied to
-    /// every absolute-mode move. Stored as a plain offset vector added
-    /// to machine coordinates - NOT as an index into a settings table,
-    /// since this crate has no concept of persistent machine settings
-    /// storage; callers are responsible for loading the right offset
-    /// into this field when a G54-G59 line is interpreted (the
-    /// interpreter records WHICH system is selected, but resolving that
-    /// selection to an actual offset value is a host-provided lookup -
-    /// see `visitor::WorkOffsetProvider`).
-    pub work_offset: Position,
+    /// Which work coordinate system (G54-G59.3) is currently selected.
+    pub coordinate_system: CoordinateSystem,
+
+    /// Per-system offset table backing `coordinate_system`. This crate
+    /// has no persistent settings storage of its own - the host
+    /// populates this table (typically once at startup, from whatever
+    /// config/EEPROM backs its controller) via
+    /// `set_coordinate_system_offset` before or during a parse. Private:
+    /// read through `coordinate_system_offset`, which callers also use
+    /// to inspect the currently active entry.
+    coordinate_system_offsets: [Position; CoordinateSystem::COUNT],
+
+    /// Additional origin shift set by G92, layered on top of whichever
+    /// `coordinate_system_offsets` entry is active (see
+    /// `Interpreter::resolve_target_from_values`). Reset to zero by
+    /// G92.1. G92.2 (suspend) and G92.3 (restore) are not implemented -
+    /// real scope decision, see `visitor` module docs.
+    pub g92_offset: Position,
 
     /// Feed rate in mm/min, already unit-converted regardless of the
     /// active Units mode at the time F was parsed.
@@ -141,7 +193,9 @@ impl Default for ModalState {
             plane: Plane::default(),
             units: Units::default(),
             distance_mode: DistanceMode::default(),
-            work_offset: Position::default(),
+            coordinate_system: CoordinateSystem::default(),
+            coordinate_system_offsets: [Position::default(); CoordinateSystem::COUNT],
+            g92_offset: Position::default(),
             feed_rate: 0.0,
             spindle_speed: 0.0,
             selected_tool: None,
@@ -162,6 +216,35 @@ impl ModalState {
         match self.units {
             Units::Millimeters => raw,
             Units::Inches => raw * 25.4,
+        }
+    }
+
+    /// Read the offset table entry for `system` - `Position::default()`
+    /// (identity) until the host sets one with
+    /// `set_coordinate_system_offset`.
+    pub fn coordinate_system_offset(&self, system: CoordinateSystem) -> Position {
+        self.coordinate_system_offsets[system.index()]
+    }
+
+    /// Populate (or update) the offset table entry for `system`. Meant
+    /// to be called by the host - typically once at startup for each of
+    /// the 9 systems from its own settings storage, though nothing
+    /// prevents calling it again mid-parse if a controller supports
+    /// redefining a work offset live (NIST's G10 L2/L20 do this from
+    /// within a program; this crate does not implement those codes yet,
+    /// so today this is exclusively a host-driven call).
+    pub fn set_coordinate_system_offset(&mut self, system: CoordinateSystem, offset: Position) {
+        self.coordinate_system_offsets[system.index()] = offset;
+    }
+
+    /// The total offset applied to absolute-mode moves: the active
+    /// work coordinate system's table entry plus the G92 shift.
+    pub fn active_offset(&self) -> Position {
+        let base = self.coordinate_system_offset(self.coordinate_system);
+        Position {
+            x: base.x + self.g92_offset.x,
+            y: base.y + self.g92_offset.y,
+            z: base.z + self.g92_offset.z,
         }
     }
 }

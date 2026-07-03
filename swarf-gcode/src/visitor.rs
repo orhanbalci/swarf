@@ -42,7 +42,7 @@ use crate::modal_groups::{
     classify_general_code, classify_miscellaneous_code, ModalGroup, ModalGroupSet,
 };
 use crate::motion::{resolve_arc_center, ArcError, ArcGeometry, MotionMode, ResolvedMotionCommand};
-use crate::state::{DistanceMode, ModalState, Plane, Position, Units};
+use crate::state::{CoordinateSystem, DistanceMode, ModalState, Plane, Position, Units};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterpretError {
@@ -127,6 +127,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
         y: Option<f32>,
         z: Option<f32>,
     ) -> Position {
+        let offset = self.state.active_offset();
         let combine = |current: f64, offset: f64, word: Option<f32>| -> f64 {
             match (word, self.state.distance_mode) {
                 (Some(v), DistanceMode::Absolute) => self.state.to_mm(v as f64) + offset,
@@ -136,9 +137,9 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
         };
 
         Position {
-            x: combine(self.state.position.x, self.state.work_offset.x, x),
-            y: combine(self.state.position.y, self.state.work_offset.y, y),
-            z: combine(self.state.position.z, self.state.work_offset.z, z),
+            x: combine(self.state.position.x, offset.x, x),
+            y: combine(self.state.position.y, offset.y, y),
+            z: combine(self.state.position.z, offset.z, z),
         }
     }
 }
@@ -186,6 +187,9 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> ProgramVisitor for Interpreter
             coolant_word: None,
             tool_change_requested: false,
             tool_select: None,
+            suppress_motion: false,
+            g92_requested: false,
+            g92_cancel_requested: false,
         })
     }
 }
@@ -227,6 +231,16 @@ struct BlockCtx<'a, M: MotionSink, C: CommandSink, E: ErrorSink> {
     tool_change_requested: bool,
     /// Tool number selected by a T word on this line, if any.
     tool_select: Option<u32>,
+    /// Set when a G-word appeared whose axis-like words are NOT motion
+    /// targets (currently: G92/G92.1) - prevents this line's X/Y/Z from
+    /// being misread as a move using whatever motion mode was last
+    /// active.
+    suppress_motion: bool,
+    /// G92 appeared: X/Y/Z on this line (if any) redefine the G92
+    /// offset rather than commanding a move.
+    g92_requested: bool,
+    /// G92.1 appeared: reset the G92 offset to zero.
+    g92_cancel_requested: bool,
 }
 
 impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockCtx<'_, M, C, E> {
@@ -326,8 +340,34 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
             }
             Some(ModalGroup::NonModal) => {
                 self.classify_and_record_group(ModalGroup::NonModal);
-                if (major, minor) == (4, None) {
-                    self.dwell_requested = true;
+                match (major, minor) {
+                    (4, None) => self.dwell_requested = true,
+                    (92, None) => {
+                        self.g92_requested = true;
+                        self.suppress_motion = true;
+                    }
+                    (92, Some(1)) => {
+                        self.g92_cancel_requested = true;
+                        self.suppress_motion = true;
+                    }
+                    _ => {}
+                }
+            }
+            Some(ModalGroup::CoordinateSystem) => {
+                self.classify_and_record_group(ModalGroup::CoordinateSystem);
+                if let Some(cs) = match (major, minor) {
+                    (54, None) => Some(CoordinateSystem::G54),
+                    (55, None) => Some(CoordinateSystem::G55),
+                    (56, None) => Some(CoordinateSystem::G56),
+                    (57, None) => Some(CoordinateSystem::G57),
+                    (58, None) => Some(CoordinateSystem::G58),
+                    (59, None) => Some(CoordinateSystem::G59),
+                    (59, Some(1)) => Some(CoordinateSystem::G59_1),
+                    (59, Some(2)) => Some(CoordinateSystem::G59_2),
+                    (59, Some(3)) => Some(CoordinateSystem::G59_3),
+                    _ => None,
+                } {
+                    self.interp.state.coordinate_system = cs;
                 }
             }
             Some(group) => self.classify_and_record_group(group),
@@ -374,8 +414,12 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
         // words at all - target defaults to start, which
         // `resolve_target_from_values` already does for omitted words -
         // but it's still a real move, so it must not be swallowed by
-        // the "nothing to resolve" branch below.
-        let has_motion_data = has_axis_word || (is_arc && has_arc_geometry);
+        // the "nothing to resolve" branch below. `suppress_motion` is
+        // the opposite case: axis-shaped words ARE present, but this
+        // line's G-word (currently just G92/G92.1) means they aren't a
+        // motion target at all.
+        let has_motion_data =
+            !self.suppress_motion && (has_axis_word || (is_arc && has_arc_geometry));
 
         if !has_motion_data {
             // No axis data on this line: either a bare modal-mode word
@@ -493,6 +537,34 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                 }
                 None => self.interp.errors.push(InterpretError::NoToolSelected),
             }
+        }
+
+        if self.g92_requested {
+            // For each axis word given, solve for the G92 offset
+            // component that makes the CURRENT machine position equal
+            // the requested value in the active coordinate system - see
+            // `motion.rs`'s docs / `ModalState::active_offset`. Axes
+            // with no word keep their previous G92 offset unchanged.
+            let cs_offset = self
+                .interp
+                .state
+                .coordinate_system_offset(self.interp.state.coordinate_system);
+            if let Some(v) = self.x {
+                let want = self.interp.state.to_mm(v as f64);
+                self.interp.state.g92_offset.x = self.interp.state.position.x - cs_offset.x - want;
+            }
+            if let Some(v) = self.y {
+                let want = self.interp.state.to_mm(v as f64);
+                self.interp.state.g92_offset.y = self.interp.state.position.y - cs_offset.y - want;
+            }
+            if let Some(v) = self.z {
+                let want = self.interp.state.to_mm(v as f64);
+                self.interp.state.g92_offset.z = self.interp.state.position.z - cs_offset.z - want;
+            }
+        }
+
+        if self.g92_cancel_requested {
+            self.interp.state.g92_offset = Position::default();
         }
     }
 }
@@ -878,5 +950,87 @@ mod tests {
         let cw = sink.commands[1].arc.expect("arc geometry");
         assert!((cw.center.y - 10.0).abs() < 1e-9);
         assert!((cw.center.z - 10.0).abs() < 1e-9);
+    }
+
+    /// Like `run`, but lets a test preload the coordinate system offset
+    /// table before parsing - standing in for a host that loads its
+    /// work offsets from settings/EEPROM at startup.
+    fn run_with_offsets(
+        offsets: &[(CoordinateSystem, Position)],
+        src: &str,
+    ) -> (CollectingSink, CollectingCommands, CollectingErrors) {
+        let mut interp = Interpreter::new(
+            CollectingSink::default(),
+            CollectingCommands::default(),
+            CollectingErrors::default(),
+        );
+        for &(system, offset) in offsets {
+            interp.state.set_coordinate_system_offset(system, offset);
+        }
+        interp.run(src);
+        interp.into_sinks()
+    }
+
+    #[test]
+    fn selecting_a_coordinate_system_applies_its_offset_to_absolute_moves() {
+        let (sink, _, errors) = run_with_offsets(
+            &[(
+                CoordinateSystem::G55,
+                Position {
+                    x: 100.0,
+                    y: 50.0,
+                    z: 0.0,
+                },
+            )],
+            "G55 G1 X10 Y0\n",
+        );
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands[0].target.x, 110.0);
+        assert_eq!(sink.commands[0].target.y, 50.0);
+    }
+
+    #[test]
+    fn default_coordinate_system_is_g54_with_no_offset() {
+        let (sink, _, errors) = run("G1 X10 Y0\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands[0].target.x, 10.0);
+    }
+
+    #[test]
+    fn g92_shifts_subsequent_absolute_moves() {
+        // At machine position (10,0), G92 X0 declares "here is X=0" -
+        // subsequent absolute moves are shifted by -10 to compensate.
+        let (sink, _, errors) = run("G0 X10\nG92 X0\nG1 X5\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 2);
+        assert_eq!(sink.commands[1].target.x, 15.0);
+    }
+
+    #[test]
+    fn g92_does_not_itself_move_the_machine() {
+        let (sink, _, errors) = run("G0 X10\nG92 X0\n");
+        assert!(errors.errors.is_empty());
+        // Only the G0 move produced a command - G92 must not be
+        // misread as a bare axis-word move using the carried G0 mode.
+        assert_eq!(sink.commands.len(), 1);
+        assert_eq!(sink.commands[0].target.x, 10.0);
+    }
+
+    #[test]
+    fn g92_only_shifts_the_axes_it_names() {
+        let (sink, _, errors) = run("G0 X10 Y20\nG92 X0\nG1 X5 Y20\n");
+        assert!(errors.errors.is_empty());
+        // X was redefined (shift -10); Y was not (shift 0).
+        assert_eq!(sink.commands[1].target.x, 15.0);
+        assert_eq!(sink.commands[1].target.y, 20.0);
+    }
+
+    #[test]
+    fn g92_1_cancels_the_offset() {
+        let (sink, _, errors) = run("G0 X10\nG92 X0\nG92.1\nG1 X5\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 2);
+        // With the G92 shift cancelled, X5 is just X5 again.
+        assert_eq!(sink.commands[1].target.x, 5.0);
     }
 }

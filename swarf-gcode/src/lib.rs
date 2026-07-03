@@ -63,11 +63,16 @@
 //!   reading this note. Parameter support is real, deferrable scope.
 //! - Block delete (`/`). Not a feature of `gcode` 0.7's grammar either -
 //!   a leading `/` is reported as a syntax diagnostic, not stripped.
-//! - Canned cycles (G73, G81-G89), tool length offset resolution, cutter
-//!   compensation, threading, splines. These are real parts of the NIST
-//!   spec but represent a large amount of additional surface area we are
-//!   deliberately staging for later, per our explicit decision to target
-//!   "core motion semantics first."
+//! - Canned cycles (G73, G81-G89), G28/G30/G53 (machine-coordinate and
+//!   predefined-position moves), G10 (set coordinate data - the
+//!   in-program alternative to a host preloading
+//!   `ModalState::set_coordinate_system_offset`), G92.2/G92.3 (suspend
+//!   and restore - only G92's set and G92.1's cancel are implemented),
+//!   tool length offset resolution, cutter compensation, threading,
+//!   splines. These are real parts of the NIST spec but represent a
+//!   large amount of additional surface area we are deliberately
+//!   staging for later, per our explicit decision to target "core
+//!   motion semantics first."
 //! - Modal-group conflict detection is started here but intentionally
 //!   minimal; see `modal_groups` module docs for current coverage.
 
@@ -81,6 +86,6 @@ pub mod visitor;
 
 pub use command::{Command, CommandSink, CoolantCommand, ProgramFlow, SpindleCommand};
 pub use modal_groups::{ModalGroup, ModalGroupSet};
-pub use motion::{ArcGeometry, MotionMode, ResolvedMotionCommand};
-pub use state::{DistanceMode, ModalState, Plane, Position, Units};
+pub use motion::{ArcError, ArcGeometry, MotionMode, ResolvedMotionCommand};
+pub use state::{CoordinateSystem, DistanceMode, ModalState, Plane, Position, Units};
 pub use visitor::{ErrorSink, InterpretError, Interpreter, MotionSink};
