@@ -41,7 +41,7 @@ use crate::command::{Command, CommandSink, CoolantCommand, ProgramFlow, SpindleC
 use crate::modal_groups::{
     classify_general_code, classify_miscellaneous_code, ModalGroup, ModalGroupSet,
 };
-use crate::motion::{MotionMode, ResolvedMotionCommand};
+use crate::motion::{resolve_arc_center, ArcError, ArcGeometry, MotionMode, ResolvedMotionCommand};
 use crate::state::{DistanceMode, ModalState, Plane, Position, Units};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,9 @@ pub enum InterpretError {
     ModalGroupConflict,
     /// M6 appeared with no T word ever having selected a tool.
     NoToolSelected,
+    /// A G2/G3 line's I/J/K/R data could not be turned into a valid arc
+    /// - see `motion::ArcError` for the specific reason.
+    InvalidArc(ArcError),
     /// A `#...` parameter reference or expression appeared as a
     /// `Value::Variable` rather than a literal. This crate does not
     /// evaluate parameters/expressions (see `lib.rs` module docs).
@@ -173,6 +176,10 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> ProgramVisitor for Interpreter
             f: None,
             p: None,
             s: None,
+            i: None,
+            j: None,
+            k: None,
+            r: None,
             dwell_requested: false,
             program_flow: None,
             spindle_word: None,
@@ -202,6 +209,13 @@ struct BlockCtx<'a, M: MotionSink, C: CommandSink, E: ErrorSink> {
     p: Option<f32>,
     /// S word - spindle speed in RPM, consumed by M3/M4.
     s: Option<f32>,
+    /// I/J/K words - arc center offset from `start`, incremental
+    /// (NIST's G91.1 default; see `motion::resolve_arc_center`).
+    i: Option<f32>,
+    j: Option<f32>,
+    k: Option<f32>,
+    /// R word - arc radius (G2/G3 radius form).
+    r: Option<f32>,
     dwell_requested: bool,
     /// Major number of an M0/M1/M2/M30 word seen this line, if any.
     program_flow: Option<u32>,
@@ -235,6 +249,10 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockCtx<'_, M, C, E> {
             'F' => self.f = Some(v),
             'P' => self.p = Some(v),
             'S' => self.s = Some(v),
+            'I' => self.i = Some(v),
+            'J' => self.j = Some(v),
+            'K' => self.k = Some(v),
+            'R' => self.r = Some(v),
             _ => {}
         }
     }
@@ -345,9 +363,21 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
 
     fn end_line(self, _span: Span) {
         let effective_mode = self.resolved_mode.unwrap_or(self.interp.state.motion_mode);
+        let is_arc = matches!(
+            effective_mode,
+            MotionMode::ArcClockwise | MotionMode::ArcCounterclockwise
+        );
         let has_axis_word = self.x.is_some() || self.y.is_some() || self.z.is_some();
+        let has_arc_geometry =
+            self.i.is_some() || self.j.is_some() || self.k.is_some() || self.r.is_some();
+        // A full-circle arc (G2/G3 I.. J.. with no X/Y/Z) has no axis
+        // words at all - target defaults to start, which
+        // `resolve_target_from_values` already does for omitted words -
+        // but it's still a real move, so it must not be swallowed by
+        // the "nothing to resolve" branch below.
+        let has_motion_data = has_axis_word || (is_arc && has_arc_geometry);
 
-        if !has_axis_word {
+        if !has_motion_data {
             // No axis data on this line: either a bare modal-mode word
             // (e.g. a lone "G1") to remember for later, or a line with
             // nothing motion-relevant at all (comment/M-code/G17-only) -
@@ -363,22 +393,55 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                 .interp
                 .resolve_target_from_values(self.x, self.y, self.z);
 
-            if let Some(f) = self.f {
-                self.interp.state.feed_rate = self.interp.state.to_mm(f as f64);
+            let mut arc = None;
+            let mut arc_failed = false;
+
+            if is_arc {
+                let ijk = if self.i.is_some() || self.j.is_some() || self.k.is_some() {
+                    Some((
+                        self.i.map_or(0.0, |v| self.interp.state.to_mm(v as f64)),
+                        self.j.map_or(0.0, |v| self.interp.state.to_mm(v as f64)),
+                        self.k.map_or(0.0, |v| self.interp.state.to_mm(v as f64)),
+                    ))
+                } else {
+                    None
+                };
+                let r = self.r.map(|v| self.interp.state.to_mm(v as f64));
+
+                match resolve_arc_center(
+                    self.interp.state.plane,
+                    start,
+                    target,
+                    ijk,
+                    r,
+                    effective_mode == MotionMode::ArcClockwise,
+                ) {
+                    Ok(center) => arc = Some(ArcGeometry { center }),
+                    Err(e) => {
+                        self.interp.errors.push(InterpretError::InvalidArc(e));
+                        arc_failed = true;
+                    }
+                }
             }
 
-            let command = ResolvedMotionCommand {
-                start,
-                target,
-                motion_mode: effective_mode,
-                arc: None,
-                feed_rate: self.interp.state.feed_rate,
-            };
+            if !arc_failed {
+                if let Some(f) = self.f {
+                    self.interp.state.feed_rate = self.interp.state.to_mm(f as f64);
+                }
 
-            self.interp.state.position = target;
-            self.interp.state.motion_mode = effective_mode;
+                let command = ResolvedMotionCommand {
+                    start,
+                    target,
+                    motion_mode: effective_mode,
+                    arc,
+                    feed_rate: self.interp.state.feed_rate,
+                };
 
-            let _ = self.interp.sink.push(command);
+                self.interp.state.position = target;
+                self.interp.state.motion_mode = effective_mode;
+
+                let _ = self.interp.sink.push(command);
+            }
         }
 
         if let Some(s) = self.s {
@@ -707,5 +770,113 @@ mod tests {
             commands.commands,
             std::vec![Command::ToolChange { tool: 5 }]
         );
+    }
+
+    #[test]
+    fn ccw_arc_by_radius_resolves_the_minor_arc_center() {
+        // Worked example (see motion.rs docs): quarter circle from
+        // (10,0) to (0,10), r=10. CCW's minor-arc center is the origin.
+        let (sink, _, errors) = run("G0 X10 Y0\nG3 X0 Y10 R10\n");
+        assert!(errors.errors.is_empty());
+        let arc = sink.commands[1].arc.expect("arc geometry");
+        assert!((arc.center.x - 0.0).abs() < 1e-9);
+        assert!((arc.center.y - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cw_arc_by_radius_resolves_the_other_minor_arc_center() {
+        // Same chord, opposite direction: CW's minor-arc center is
+        // (10,10), not the origin - see motion.rs's worked example.
+        let (sink, _, errors) = run("G0 X10 Y0\nG2 X0 Y10 R10\n");
+        assert!(errors.errors.is_empty());
+        let arc = sink.commands[1].arc.expect("arc geometry");
+        assert!((arc.center.x - 10.0).abs() < 1e-9);
+        assert!((arc.center.y - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn arc_by_ijk_center_is_start_plus_offset() {
+        let (sink, _, errors) = run("G2 X10 Y0 I5 J0\n");
+        assert!(errors.errors.is_empty());
+        let arc = sink.commands[0].arc.expect("arc geometry");
+        assert_eq!(arc.center.x, 5.0);
+        assert_eq!(arc.center.y, 0.0);
+    }
+
+    #[test]
+    fn full_circle_via_ijk_with_no_axis_words_targets_the_start_point() {
+        let (sink, _, errors) = run("G0 X10 Y0\nG2 I-10 J0\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(sink.commands.len(), 2);
+        let full_circle = sink.commands[1];
+        assert_eq!(full_circle.target, full_circle.start);
+        let arc = full_circle.arc.expect("arc geometry");
+        assert!((arc.center.x - 0.0).abs() < 1e-9);
+        assert!((arc.center.y - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn arc_with_neither_ijk_nor_r_is_a_missing_geometry_error() {
+        let (sink, _, errors) = run("G2 X10 Y0\n");
+        assert!(sink.commands.is_empty());
+        assert!(errors
+            .errors
+            .contains(&InterpretError::InvalidArc(ArcError::MissingGeometry)));
+    }
+
+    #[test]
+    fn radius_smaller_than_half_the_chord_is_an_error() {
+        // Chord length is 10; no circle of radius 1 passes through
+        // points 10 apart.
+        let (sink, _, errors) = run("G2 X10 Y0 R1\n");
+        assert!(sink.commands.is_empty());
+        assert!(errors
+            .errors
+            .contains(&InterpretError::InvalidArc(ArcError::RadiusTooSmall)));
+    }
+
+    #[test]
+    fn radius_form_with_coincident_start_and_end_is_an_error() {
+        let (sink, _, errors) = run("G2 R5\n");
+        assert!(sink.commands.is_empty());
+        assert!(errors
+            .errors
+            .contains(&InterpretError::InvalidArc(ArcError::CoincidentEndpoints)));
+    }
+
+    #[test]
+    fn ccw_arc_in_zx_plane_uses_the_same_cyclic_convention_as_xy() {
+        let (sink, _, errors) = run("G18\nG0 Z10 X0\nG3 Z0 X10 R10\n");
+        assert!(errors.errors.is_empty());
+        let ccw = sink.commands[1].arc.expect("arc geometry");
+        assert!((ccw.center.z - 0.0).abs() < 1e-9);
+        assert!((ccw.center.x - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cw_arc_in_zx_plane_uses_the_same_cyclic_convention_as_xy() {
+        let (sink, _, errors) = run("G18\nG0 Z10 X0\nG2 Z0 X10 R10\n");
+        assert!(errors.errors.is_empty());
+        let cw = sink.commands[1].arc.expect("arc geometry");
+        assert!((cw.center.z - 10.0).abs() < 1e-9);
+        assert!((cw.center.x - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ccw_arc_in_yz_plane_uses_the_same_cyclic_convention_as_xy() {
+        let (sink, _, errors) = run("G19\nG0 Y10 Z0\nG3 Y0 Z10 R10\n");
+        assert!(errors.errors.is_empty());
+        let ccw = sink.commands[1].arc.expect("arc geometry");
+        assert!((ccw.center.y - 0.0).abs() < 1e-9);
+        assert!((ccw.center.z - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cw_arc_in_yz_plane_uses_the_same_cyclic_convention_as_xy() {
+        let (sink, _, errors) = run("G19\nG0 Y10 Z0\nG2 Y0 Z10 R10\n");
+        assert!(errors.errors.is_empty());
+        let cw = sink.commands[1].arc.expect("arc geometry");
+        assert!((cw.center.y - 10.0).abs() < 1e-9);
+        assert!((cw.center.z - 10.0).abs() < 1e-9);
     }
 }

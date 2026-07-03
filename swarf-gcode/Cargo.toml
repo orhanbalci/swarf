@@ -13,3 +13,7 @@ description = "A NIST RS274NGC-compatible modal-state G-code interpreter. Resolv
 # does this crate, so the whole thing builds as genuine no_std with no
 # heap allocation anywhere in the interpreter.
 gcode = { version = "0.7", default-features = false }
+# core::f64 has no sqrt in no_std - libm provides it. Same crate gcode
+# itself already pulls in for its own no_std trig, so this adds no new
+# dependency to the build graph.
+libm = "0.2"
