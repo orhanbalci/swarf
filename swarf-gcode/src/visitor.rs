@@ -20,10 +20,15 @@
 //! it syntactically (e.g. "G1 G91 X10": X is the line's target, not
 //! specifically G91's argument).
 //!
+//! Non-motion effects (spindle, coolant, tool change, dwell, program
+//! flow) are resolved the same way, into `Command` (Interface 3,
+//! `command.rs`) instead of `ResolvedMotionCommand` - see that module's
+//! docs for why they're a separate sink rather than folded in.
+//!
 //! This module (and the crate as a whole) is allocation-free: `gcode`
 //! 0.7's `core` module has no `alloc` dependency, and neither do we -
-//! per-line state is a handful of `Option<f32>` fields on `BlockCtx`,
-//! not a `Vec`.
+//! per-line state is a handful of `Option` fields on `BlockCtx`, not a
+//! `Vec`.
 
 use core::num::ParseIntError;
 
@@ -32,6 +37,7 @@ use gcode::core::{
     ProgramVisitor, Span, TokenType, Value,
 };
 
+use crate::command::{Command, CommandSink, CoolantCommand, ProgramFlow, SpindleCommand};
 use crate::modal_groups::{
     classify_general_code, classify_miscellaneous_code, ModalGroup, ModalGroupSet,
 };
@@ -49,6 +55,8 @@ pub enum InterpretError {
     /// Two G or M words from the same NIST modal group appeared on one
     /// line (e.g. "G0 G1 X10").
     ModalGroupConflict,
+    /// M6 appeared with no T word ever having selected a tool.
+    NoToolSelected,
     /// A `#...` parameter reference or expression appeared as a
     /// `Value::Variable` rather than a literal. This crate does not
     /// evaluate parameters/expressions (see `lib.rs` module docs).
@@ -79,18 +87,21 @@ pub trait ErrorSink {
 }
 
 /// The interpreter. Owns the one persistent piece of state
-/// (`ModalState`), a motion sink, and an error sink.
-pub struct Interpreter<M: MotionSink, E: ErrorSink> {
+/// (`ModalState`), a motion sink, a non-motion command sink, and an
+/// error sink.
+pub struct Interpreter<M: MotionSink, C: CommandSink, E: ErrorSink> {
     pub state: ModalState,
     sink: M,
+    commands: C,
     errors: E,
 }
 
-impl<M: MotionSink, E: ErrorSink> Interpreter<M, E> {
-    pub fn new(sink: M, errors: E) -> Self {
+impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
+    pub fn new(sink: M, commands: C, errors: E) -> Self {
         Self {
             state: ModalState::new(),
             sink,
+            commands,
             errors,
         }
     }
@@ -103,8 +114,8 @@ impl<M: MotionSink, E: ErrorSink> Interpreter<M, E> {
     /// Consume the interpreter, handing back the sinks it was built
     /// with - typically to inspect what a `std`-based test/caller
     /// collected into them.
-    pub fn into_sinks(self) -> (M, E) {
-        (self.sink, self.errors)
+    pub fn into_sinks(self) -> (M, C, E) {
+        (self.sink, self.commands, self.errors)
     }
 
     fn resolve_target_from_values(
@@ -129,7 +140,7 @@ impl<M: MotionSink, E: ErrorSink> Interpreter<M, E> {
     }
 }
 
-impl<M: MotionSink, E: ErrorSink> CoreDiagnostics for Interpreter<M, E> {
+impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for Interpreter<M, C, E> {
     fn emit_unknown_content(&mut self, _text: &str, span: Span) {
         self.errors.push(InterpretError::SyntaxError(span));
     }
@@ -150,7 +161,7 @@ impl<M: MotionSink, E: ErrorSink> CoreDiagnostics for Interpreter<M, E> {
     }
 }
 
-impl<M: MotionSink, E: ErrorSink> ProgramVisitor for Interpreter<M, E> {
+impl<M: MotionSink, C: CommandSink, E: ErrorSink> ProgramVisitor for Interpreter<M, C, E> {
     fn start_block(&mut self) -> ControlFlow<impl BlockVisitor + '_> {
         ControlFlow::Continue(BlockCtx {
             interp: self,
@@ -160,29 +171,55 @@ impl<M: MotionSink, E: ErrorSink> ProgramVisitor for Interpreter<M, E> {
             y: None,
             z: None,
             f: None,
+            p: None,
+            s: None,
+            dwell_requested: false,
+            program_flow: None,
+            spindle_word: None,
+            coolant_word: None,
+            tool_change_requested: false,
+            tool_select: None,
         })
     }
 }
 
 /// Per-line scratch: which modal groups were touched this line (for
 /// conflict detection), which motion mode (if any) this line's G-word
-/// resolved to, and the pooled axis/feed values seen anywhere on the
-/// line - whether via a bare `word_address` or as an `argument` of some
-/// command. Borrows the one real state owner, `Interpreter`.
-struct BlockCtx<'a, M: MotionSink, E: ErrorSink> {
-    interp: &'a mut Interpreter<M, E>,
+/// resolved to, the pooled axis/feed/dwell/spindle values seen anywhere
+/// on the line (whether via a bare `word_address` or as an `argument`
+/// of some command), and which non-motion effects (dwell, program flow,
+/// spindle, coolant, tool change/select) were requested. Borrows the
+/// one real state owner, `Interpreter`.
+struct BlockCtx<'a, M: MotionSink, C: CommandSink, E: ErrorSink> {
+    interp: &'a mut Interpreter<M, C, E>,
     seen_groups: ModalGroupSet,
     resolved_mode: Option<MotionMode>,
     x: Option<f32>,
     y: Option<f32>,
     z: Option<f32>,
     f: Option<f32>,
+    /// P word - dwell time in seconds (G4).
+    p: Option<f32>,
+    /// S word - spindle speed in RPM, consumed by M3/M4.
+    s: Option<f32>,
+    dwell_requested: bool,
+    /// Major number of an M0/M1/M2/M30 word seen this line, if any.
+    program_flow: Option<u32>,
+    /// Major number of an M3/M4/M5 word seen this line, if any.
+    spindle_word: Option<u32>,
+    /// Major number of an M7/M8/M9 word seen this line, if any.
+    coolant_word: Option<u32>,
+    /// Whether an M6 word was seen this line.
+    tool_change_requested: bool,
+    /// Tool number selected by a T word on this line, if any.
+    tool_select: Option<u32>,
 }
 
-impl<M: MotionSink, E: ErrorSink> BlockCtx<'_, M, E> {
-    /// Record an X/Y/Z/F value into this line's shared pool, rejecting
-    /// (with `UnsupportedSyntax`) anything that isn't a literal number -
-    /// parameters/expressions are out of scope, see `InterpretError`.
+impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockCtx<'_, M, C, E> {
+    /// Record an X/Y/Z/F/P/S value into this line's shared pool,
+    /// rejecting (with `UnsupportedSyntax`) anything that isn't a
+    /// literal number - parameters/expressions are out of scope, see
+    /// `InterpretError`.
     fn record_axis(&mut self, letter: char, value: Value<'_>) {
         let v = match value {
             Value::Literal(v) => v,
@@ -196,6 +233,8 @@ impl<M: MotionSink, E: ErrorSink> BlockCtx<'_, M, E> {
             'Y' => self.y = Some(v),
             'Z' => self.z = Some(v),
             'F' => self.f = Some(v),
+            'P' => self.p = Some(v),
+            'S' => self.s = Some(v),
             _ => {}
         }
     }
@@ -208,7 +247,7 @@ impl<M: MotionSink, E: ErrorSink> BlockCtx<'_, M, E> {
     }
 }
 
-impl<M: MotionSink, E: ErrorSink> CoreDiagnostics for BlockCtx<'_, M, E> {
+impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for BlockCtx<'_, M, C, E> {
     fn emit_unknown_content(&mut self, text: &str, span: Span) {
         self.interp.emit_unknown_content(text, span);
     }
@@ -222,7 +261,7 @@ impl<M: MotionSink, E: ErrorSink> CoreDiagnostics for BlockCtx<'_, M, E> {
     }
 }
 
-impl<M: MotionSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, M, E> {
+impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, M, C, E> {
     fn word_address(&mut self, letter: char, value: Value<'_>, _span: Span) {
         self.record_axis(letter, value);
     }
@@ -267,6 +306,12 @@ impl<M: MotionSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, M, E> {
                     _ => self.interp.state.distance_mode,
                 };
             }
+            Some(ModalGroup::NonModal) => {
+                self.classify_and_record_group(ModalGroup::NonModal);
+                if (major, minor) == (4, None) {
+                    self.dwell_requested = true;
+                }
+            }
             Some(group) => self.classify_and_record_group(group),
             None => {}
         }
@@ -282,11 +327,19 @@ impl<M: MotionSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, M, E> {
         let minor = number.minor().map(|n| n.get());
         if let Some(group) = classify_miscellaneous_code(major, minor) {
             self.classify_and_record_group(group);
+            match group {
+                ModalGroup::ProgramStopping => self.program_flow = Some(major),
+                ModalGroup::SpindleTurning => self.spindle_word = Some(major),
+                ModalGroup::CoolantControl => self.coolant_word = Some(major),
+                ModalGroup::ToolChange => self.tool_change_requested = true,
+                _ => {}
+            }
         }
-        ControlFlow::Continue(Noop)
+        ControlFlow::Continue(CommandCtx { block: self })
     }
 
-    fn start_tool_change_code(&mut self, _number: Number) -> ControlFlow<impl CommandVisitor + '_> {
+    fn start_tool_change_code(&mut self, number: Number) -> ControlFlow<impl CommandVisitor + '_> {
+        self.tool_select = Some(number.major());
         ControlFlow::Continue(Noop)
     }
 
@@ -302,48 +355,95 @@ impl<M: MotionSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, M, E> {
             if let Some(mode) = self.resolved_mode {
                 self.interp.state.motion_mode = mode;
             }
-            return;
-        }
-
-        if effective_mode == MotionMode::None {
+        } else if effective_mode == MotionMode::None {
             self.interp.errors.push(InterpretError::NoActiveMotionMode);
-            return;
+        } else {
+            let start = self.interp.state.position;
+            let target = self
+                .interp
+                .resolve_target_from_values(self.x, self.y, self.z);
+
+            if let Some(f) = self.f {
+                self.interp.state.feed_rate = self.interp.state.to_mm(f as f64);
+            }
+
+            let command = ResolvedMotionCommand {
+                start,
+                target,
+                motion_mode: effective_mode,
+                arc: None,
+                feed_rate: self.interp.state.feed_rate,
+            };
+
+            self.interp.state.position = target;
+            self.interp.state.motion_mode = effective_mode;
+
+            let _ = self.interp.sink.push(command);
         }
 
-        let start = self.interp.state.position;
-        let target = self
-            .interp
-            .resolve_target_from_values(self.x, self.y, self.z);
-
-        if let Some(f) = self.f {
-            self.interp.state.feed_rate = self.interp.state.to_mm(f as f64);
+        if let Some(s) = self.s {
+            self.interp.state.spindle_speed = s as f64;
         }
 
-        let command = ResolvedMotionCommand {
-            start,
-            target,
-            motion_mode: effective_mode,
-            arc: None,
-            feed_rate: self.interp.state.feed_rate,
-        };
+        if let Some(major) = self.spindle_word {
+            let speed = self.interp.state.spindle_speed;
+            let cmd = match major {
+                3 => SpindleCommand::Clockwise(speed),
+                4 => SpindleCommand::CounterClockwise(speed),
+                _ => SpindleCommand::Stop, // M5
+            };
+            let _ = self.interp.commands.push(Command::Spindle(cmd));
+        }
 
-        self.interp.state.position = target;
-        self.interp.state.motion_mode = effective_mode;
+        if let Some(major) = self.coolant_word {
+            let cmd = match major {
+                7 => CoolantCommand::Mist,
+                8 => CoolantCommand::Flood,
+                _ => CoolantCommand::Off, // M9
+            };
+            let _ = self.interp.commands.push(Command::Coolant(cmd));
+        }
 
-        let _ = self.interp.sink.push(command);
+        if let Some(major) = self.program_flow {
+            let flow = match major {
+                0 => ProgramFlow::Stop,
+                1 => ProgramFlow::OptionalStop,
+                2 => ProgramFlow::End,
+                _ => ProgramFlow::EndAndRewind, // M30
+            };
+            let _ = self.interp.commands.push(Command::ProgramFlow(flow));
+        }
+
+        if self.tool_select.is_some() {
+            self.interp.state.selected_tool = self.tool_select;
+        }
+
+        if self.dwell_requested {
+            let seconds = self.p.unwrap_or(0.0) as f64;
+            let _ = self.interp.commands.push(Command::Dwell { seconds });
+        }
+
+        if self.tool_change_requested {
+            match self.interp.state.selected_tool {
+                Some(tool) => {
+                    let _ = self.interp.commands.push(Command::ToolChange { tool });
+                }
+                None => self.interp.errors.push(InterpretError::NoToolSelected),
+            }
+        }
     }
 }
 
 /// Per-command scratch, sharing the SAME pending-axis accumulator as
 /// its parent `BlockCtx` - a command's arguments (e.g. the `X10 Y20`
-/// following a `G1`) are pooled into the line's axis data exactly like
-/// a bare `word_address` would be, per NIST's line-is-the-unit
-/// semantics (see this module's docs).
-struct CommandCtx<'a, 'b, M: MotionSink, E: ErrorSink> {
-    block: &'a mut BlockCtx<'b, M, E>,
+/// following a `G1`, or the `S1000` following an `M3`) are pooled into
+/// the line's data exactly like a bare `word_address` would be, per
+/// NIST's line-is-the-unit semantics (see this module's docs).
+struct CommandCtx<'a, 'b, M: MotionSink, C: CommandSink, E: ErrorSink> {
+    block: &'a mut BlockCtx<'b, M, C, E>,
 }
 
-impl<M: MotionSink, E: ErrorSink> CoreDiagnostics for CommandCtx<'_, '_, M, E> {
+impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for CommandCtx<'_, '_, M, C, E> {
     fn emit_unknown_content(&mut self, text: &str, span: Span) {
         self.block.emit_unknown_content(text, span);
     }
@@ -357,7 +457,7 @@ impl<M: MotionSink, E: ErrorSink> CoreDiagnostics for CommandCtx<'_, '_, M, E> {
     }
 }
 
-impl<M: MotionSink, E: ErrorSink> CommandVisitor for CommandCtx<'_, '_, M, E> {
+impl<M: MotionSink, C: CommandSink, E: ErrorSink> CommandVisitor for CommandCtx<'_, '_, M, C, E> {
     fn argument(&mut self, letter: char, value: Value<'_>, _span: Span) {
         self.block.record_axis(letter, value);
     }
@@ -382,6 +482,18 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct CollectingCommands {
+        commands: std::vec::Vec<Command>,
+    }
+
+    impl CommandSink for CollectingCommands {
+        fn push(&mut self, command: Command) -> Result<(), ()> {
+            self.commands.push(command);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
     struct CollectingErrors {
         errors: std::vec::Vec<InterpretError>,
     }
@@ -392,15 +504,19 @@ mod tests {
         }
     }
 
-    fn run(src: &str) -> (CollectingSink, CollectingErrors) {
-        let mut interp = Interpreter::new(CollectingSink::default(), CollectingErrors::default());
+    fn run(src: &str) -> (CollectingSink, CollectingCommands, CollectingErrors) {
+        let mut interp = Interpreter::new(
+            CollectingSink::default(),
+            CollectingCommands::default(),
+            CollectingErrors::default(),
+        );
         interp.run(src);
         interp.into_sinks()
     }
 
     #[test]
     fn simple_linear_move_resolves_to_one_command() {
-        let (sink, _) = run("G1 X10 Y20\n");
+        let (sink, _, _) = run("G1 X10 Y20\n");
         assert_eq!(sink.commands.len(), 1);
         let cmd = sink.commands[0];
         assert_eq!(cmd.motion_mode, MotionMode::Linear);
@@ -411,7 +527,7 @@ mod tests {
 
     #[test]
     fn modal_carry_forward_reuses_previous_motion_mode() {
-        let (sink, _) = run("G1 X10\nY20\n");
+        let (sink, _, _) = run("G1 X10\nY20\n");
         assert_eq!(sink.commands.len(), 2);
         assert_eq!(sink.commands[1].motion_mode, MotionMode::Linear);
         assert_eq!(sink.commands[1].target.y, 20.0);
@@ -420,14 +536,14 @@ mod tests {
 
     #[test]
     fn bare_axis_words_before_any_command_have_no_active_motion_mode() {
-        let (sink, errors) = run("X10\n");
+        let (sink, _, errors) = run("X10\n");
         assert_eq!(sink.commands.len(), 0);
         assert!(errors.errors.contains(&InterpretError::NoActiveMotionMode));
     }
 
     #[test]
     fn incremental_distance_mode_adds_to_current_position() {
-        let (sink, _) = run("G1 G91 X10\nX10\n");
+        let (sink, _, _) = run("G1 G91 X10\nX10\n");
         assert_eq!(sink.commands.len(), 2);
         assert_eq!(sink.commands[0].target.x, 10.0);
         assert_eq!(sink.commands[1].target.x, 20.0);
@@ -435,27 +551,27 @@ mod tests {
 
     #[test]
     fn conflicting_motion_words_on_one_line_is_detected() {
-        let (_, errors) = run("G0 G1 X10\n");
+        let (_, _, errors) = run("G0 G1 X10\n");
         assert!(errors.errors.contains(&InterpretError::ModalGroupConflict));
     }
 
     #[test]
     fn plane_and_motion_words_coexist_without_conflict() {
-        let (sink, errors) = run("G17 G1 X10\n");
+        let (sink, _, errors) = run("G17 G1 X10\n");
         assert!(!errors.errors.contains(&InterpretError::ModalGroupConflict));
         assert_eq!(sink.commands.len(), 1);
     }
 
     #[test]
     fn units_conversion_applies_to_subsequent_literals() {
-        let (sink, _) = run("G20 G1 X1\n");
+        let (sink, _, _) = run("G20 G1 X1\n");
         assert_eq!(sink.commands.len(), 1);
         assert!((sink.commands[0].target.x - 25.4).abs() < 1e-6);
     }
 
     #[test]
     fn rapid_and_linear_are_distinct_modes_in_output() {
-        let (sink, _) = run("G0 X5\nG1 X10\n");
+        let (sink, _, _) = run("G0 X5\nG1 X10\n");
         assert_eq!(sink.commands.len(), 2);
         assert_eq!(sink.commands[0].motion_mode, MotionMode::Rapid);
         assert_eq!(sink.commands[1].motion_mode, MotionMode::Linear);
@@ -463,7 +579,7 @@ mod tests {
 
     #[test]
     fn multiple_lines_accumulate_position_correctly() {
-        let (sink, _) = run("G1 X10 Y0\nX20 Y10\nX0 Y0\n");
+        let (sink, _, _) = run("G1 X10 Y0\nX20 Y10\nX0 Y0\n");
         assert_eq!(sink.commands.len(), 3);
         assert_eq!(
             sink.commands[0].target,
@@ -502,12 +618,94 @@ mod tests {
         // `Value::Variable` handling in `record_axis` is kept as
         // forward-compatible dead code for if/when a future `gcode`
         // release actually implements parameter parsing.
-        let (sink, errors) = run("G1 X#1\n");
+        let (sink, _, errors) = run("G1 X#1\n");
         assert!(sink.commands.is_empty());
         assert!(!errors.errors.is_empty());
         assert!(errors
             .errors
             .iter()
             .all(|e| matches!(e, InterpretError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn spindle_on_with_speed_is_resolved() {
+        let (_, commands, _) = run("M3 S1000\n");
+        assert_eq!(
+            commands.commands,
+            std::vec![Command::Spindle(SpindleCommand::Clockwise(1000.0))]
+        );
+    }
+
+    #[test]
+    fn spindle_speed_is_modal_across_lines() {
+        let (_, commands, _) = run("S500\nM3\nM5\nM4\n");
+        assert_eq!(
+            commands.commands,
+            std::vec![
+                Command::Spindle(SpindleCommand::Clockwise(500.0)),
+                Command::Spindle(SpindleCommand::Stop),
+                Command::Spindle(SpindleCommand::CounterClockwise(500.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn coolant_commands_are_resolved() {
+        let (_, commands, _) = run("M8\nM9\n");
+        assert_eq!(
+            commands.commands,
+            std::vec![
+                Command::Coolant(CoolantCommand::Flood),
+                Command::Coolant(CoolantCommand::Off),
+            ]
+        );
+    }
+
+    #[test]
+    fn dwell_reads_p_word_in_seconds() {
+        let (_, commands, _) = run("G4 P1.5\n");
+        assert_eq!(
+            commands.commands,
+            std::vec![Command::Dwell { seconds: 1.5 }]
+        );
+    }
+
+    #[test]
+    fn program_flow_codes_are_resolved() {
+        let (_, commands, _) = run("M0\nM1\nM2\nM30\n");
+        assert_eq!(
+            commands.commands,
+            std::vec![
+                Command::ProgramFlow(ProgramFlow::Stop),
+                Command::ProgramFlow(ProgramFlow::OptionalStop),
+                Command::ProgramFlow(ProgramFlow::End),
+                Command::ProgramFlow(ProgramFlow::EndAndRewind),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_select_then_change_resolves_with_selected_tool_number() {
+        let (_, commands, _) = run("T4\nM6\n");
+        assert_eq!(
+            commands.commands,
+            std::vec![Command::ToolChange { tool: 4 }]
+        );
+    }
+
+    #[test]
+    fn tool_change_without_prior_selection_is_an_error() {
+        let (_, commands, errors) = run("M6\n");
+        assert!(commands.commands.is_empty());
+        assert!(errors.errors.contains(&InterpretError::NoToolSelected));
+    }
+
+    #[test]
+    fn tool_select_and_change_on_the_same_line_resolves_immediately() {
+        let (_, commands, _) = run("T5 M6\n");
+        assert_eq!(
+            commands.commands,
+            std::vec![Command::ToolChange { tool: 5 }]
+        );
     }
 }

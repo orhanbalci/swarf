@@ -73,12 +73,14 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod command;
 pub mod modal_groups;
 pub mod motion;
 pub mod state;
 pub mod visitor;
 
+pub use command::{Command, CommandSink, CoolantCommand, ProgramFlow, SpindleCommand};
 pub use modal_groups::{ModalGroup, ModalGroupSet};
 pub use motion::{ArcGeometry, MotionMode, ResolvedMotionCommand};
 pub use state::{DistanceMode, ModalState, Plane, Position, Units};
-pub use visitor::{InterpretError, Interpreter, MotionSink};
+pub use visitor::{ErrorSink, InterpretError, Interpreter, MotionSink};

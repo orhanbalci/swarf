@@ -120,6 +120,17 @@ pub struct ModalState {
     /// Feed rate in mm/min, already unit-converted regardless of the
     /// active Units mode at the time F was parsed.
     pub feed_rate: f64,
+
+    /// Spindle speed in RPM, modal like feed rate: an S word persists
+    /// across lines and is only consumed (turned into a
+    /// `command::SpindleCommand`) when M3/M4 actually runs.
+    pub spindle_speed: f64,
+
+    /// The tool number most recently selected by a T word - modal, but
+    /// distinct from "the tool that is actually loaded": selecting a
+    /// tool (T) and changing to it (M6) are two separate NIST actions.
+    /// `None` until the first T word is ever seen.
+    pub selected_tool: Option<u32>,
 }
 
 impl Default for ModalState {
@@ -132,6 +143,8 @@ impl Default for ModalState {
             distance_mode: DistanceMode::default(),
             work_offset: Position::default(),
             feed_rate: 0.0,
+            spindle_speed: 0.0,
+            selected_tool: None,
         }
     }
 }

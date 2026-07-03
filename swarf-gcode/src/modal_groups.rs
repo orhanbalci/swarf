@@ -50,11 +50,14 @@ pub enum ModalGroup {
     CannedCycleReturnMode,
     /// M0, M1, M2, M30 - program stopping.
     ProgramStopping,
-    /// M3, M4, M5 - spindle turning. Tracked for conflict detection only;
-    /// spindle state itself is out of this crate's motion-only scope.
+    /// M3, M4, M5 - spindle turning.
     SpindleTurning,
-    /// M7, M8, M9 - coolant control. Same scope note as spindle.
+    /// M7, M8, M9 - coolant control.
     CoolantControl,
+    /// M6 - tool change. Its own single-member NIST group (Table 4,
+    /// group 6) - distinct from the T word itself, which selects a tool
+    /// number but isn't a modal-group member at all.
+    ToolChange,
 }
 
 /// A small fixed-size set of modal groups seen so far on the current
@@ -89,6 +92,7 @@ impl ModalGroupSet {
             ModalGroup::ProgramStopping => 1 << 9,
             ModalGroup::SpindleTurning => 1 << 10,
             ModalGroup::CoolantControl => 1 << 11,
+            ModalGroup::ToolChange => 1 << 12,
         }
     }
 
@@ -187,6 +191,7 @@ pub fn classify_miscellaneous_code(major: u32, minor: Option<u32>) -> Option<Mod
         (0, None) | (1, None) | (2, None) | (30, None) => ProgramStopping,
         (3, None) | (4, None) | (5, None) => SpindleTurning,
         (7, None) | (8, None) | (9, None) => CoolantControl,
+        (6, None) => ToolChange,
         _ => return None,
     })
 }
