@@ -8,7 +8,7 @@ middle.
 
 The project is being built bottom-up, one layer at a time. The first crate —
 and the current focus — is the **interpreter**: the layer that turns parsed
-G-code into concrete motion commands.
+G-code into concrete motion and machine commands.
 
 ## Architecture
 
@@ -18,18 +18,21 @@ The intended end-to-end pipeline, from serial bytes to real motion:
 Serial bytes
   │
   ▼
-[Line assembler]        byte-by-byte; watches for \n / \r → one complete line
-  │
+[Interpreter]    ★      swarf-gcode (this repo): parses one line at a time
+  │                     (gcode crate's zero-allocation visitor API), mutates
+  │                     persistent modal state, validates modal-group
+  │                     conflicts, and emits an ordered stream of resolved
+  │                     output (moves AND non-motion commands, one sink,
+  │                     exact execution order preserved)
   ▼
-[Parser]                gcode crate → one Block (codes + word addresses)
-  │
+[Motion planner]        swarf-motion (planned): trajectory / acceleration
+  │                     planning, look-ahead junction velocities, arc/canned-
+  │                     cycle interpolation - this crate deliberately leaves
+  │                     arcs unflattened and canned cycles as plain rapid/
+  │                     feed legs so this layer owns that math
   ▼
-[Interpreter]    ★      swarf-gcode (this repo): mutates persistent modal state,
-  │                     validates modal-group conflicts, emits ONE frozen
-  │                     ResolvedMotionCommand (an owned snapshot, no live refs)
-  ▼
-[Ring buffer]           bounded; backpressure stalls the assembler when full;
-  │                     full backward/forward replan on every push/pop
+[Ring buffer]           bounded; backpressure stalls the interpreter when
+  │                     full (see swarf-gcode's `Interpreter::step` docs)
   ▼
 [Executor]              pops from the front, drives real motion
   ▲
@@ -39,15 +42,40 @@ Serial bytes
 
 ★ = the layer implemented today.
 
+### Two real-time tiers
+
+CNC firmware splits into two tiers with very different constraints, and the
+crates above map onto them deliberately:
+
+- **Tier A — interpretation & planning.** Where `swarf-gcode` and
+  `swarf-motion` live. Soft deadline: "keep up with how fast the machine
+  physically moves" (milliseconds to seconds per move). Rich abstractions are
+  fine here — traits, generics, enums, fallible `Result`-returning APIs, even
+  loops that aren't provably bounded at compile time (e.g. peck-drilling a
+  deep hole). This mirrors where grblHAL's own `gc_execute_line()` and
+  planner ring buffer live: the main loop, not an interrupt handler.
+- **Tier B — trajectory execution.** Stepper ISR / step-pulse generation.
+  Hard deadline: microseconds, every tick, no exceptions. Requires
+  deterministic, branch-minimal, allocation-free, ISR-safe code —
+  `swarf-step` (and the parts of `swarf-kinematics` invoked per-step, for
+  machine geometries that need continuous inverse kinematics) belong here.
+
+Interpretation never belongs in Tier B — no real controller parses G-code
+inside a stepper ISR — and Tier-B constraints (bounded loops, no branching,
+ISR safety) should never leak backward into `swarf-gcode` or `swarf-motion`.
+Conversely, Tier-A abstractions have no place in whatever code actually runs
+in the ISR. Keeping this boundary sharp as new crates land is a project-wide
+design rule, not just a one-off decision in `swarf-gcode`.
+
 ## Crates
 
-| Crate          | Status      | Role                                                        |
-| -------------- | ----------- | ----------------------------------------------------------- |
-| `swarf-gcode`  | in progress | G-code interpreter: parsed G-code → `ResolvedMotionCommand` |
-| `swarf-motion` | planned     | Trajectory / acceleration planner (the ring-buffer stage)   |
-| `swarf-kinematics` | planned | Cartesian / CoreXY / delta / lathe coordinate transforms    |
-| `swarf-step`   | planned     | Step/dir pulse generation and stepper timing                |
-| `swarf-hal`    | planned     | Board / MCU hardware abstraction                            |
+| Crate              | Status      | Tier | Role                                                             |
+| ------------------ | ----------- | ---- | ----------------------------------------------------------------|
+| `swarf-gcode`      | in progress | A    | G-code interpreter: G-code text → ordered motion/command output |
+| `swarf-motion`     | planned     | A    | Trajectory / acceleration planner (the ring-buffer stage)        |
+| `swarf-kinematics` | planned     | A/B  | Cartesian / CoreXY / delta / lathe coordinate transforms         |
+| `swarf-step`       | planned     | B    | Step/dir pulse generation and stepper timing                     |
+| `swarf-hal`        | planned     | B    | Board / MCU hardware abstraction                                 |
 
 ## `swarf-gcode`
 
@@ -56,69 +84,110 @@ equivalent of what grblHAL calls `gc_state` and what the NIST reference
 implementation calls the interpreter proper — verified against:
 
 - the NIST RS274NGC Interpreter Version 3 spec (modal groups, Table 4),
-- grblHAL's `gc_state` / `gcode.c` as a live reference,
-- the `gcode` crate's actual parsing API.
+- grblHAL's `gc_state` / `gcode.c`, including its published supported-codes
+  list, as a live reference,
+- the `gcode` 0.7 crate's zero-allocation visitor API.
 
-It tracks the persistent modal state a motion planner needs (position, active
-motion mode, plane, units, distance mode, work offset, feed rate), detects
-modal-group conflicts the parser won't catch (e.g. `G0 G1` on one line), and
-resolves G90/G91 distance mode and G20/G21 units into absolute,
-millimetre-space targets — handing each line off as one immutable
-`ResolvedMotionCommand`.
+It is `no_std` and performs no heap allocation anywhere.
+
+### What it supports today
+
+- **Motion**: G0/G1 straight moves, G2/G3 arcs (I/J/K center form and R
+  radius form, in all three planes G17/G18/G19).
+- **Canned drilling cycles**: G81, G82, G83 (peck), G85, G86, G89, with
+  G98/G99 retract-mode control (G17/XY plane only, one hole per line).
+- **Non-modal positioning**: G28/G30 (return to a stored reference position,
+  with G28.1/G30.1 to set it) and G53 (one-line machine-coordinate override).
+- **Work coordinates**: G54–G59.3 selection (offsets preloaded by the host)
+  and G92/G92.1 (set/cancel an additional origin shift).
+- **Modal state**: plane, units (G20/G21), distance mode (G90/G91), arc
+  IJK-distance mode, feed-rate mode (tracked).
+- **Non-motion machine commands**, in the same ordered output stream as
+  motion (not a separate, unordered channel): M3/M4/M5 spindle (with modal
+  S), M7/M8/M9 coolant, M0/M1/M2/M30 program flow, T + M6 tool select/change,
+  G4 dwell.
+- **Modal-group conflict detection** per NIST Table 4 (e.g. `G0 G1 X10` on
+  one line).
+
+Deliberately **not yet** implemented (staged for later — see `swarf-gcode`'s
+own crate docs for the full, current list): parameter/expression evaluation
+(`#1`, `#<expr>`), block delete (`/`), G10, G92.2/G92.3, the `L` canned-cycle
+repeat count, tool length offset, cutter compensation, threading, splines,
+and lathe-specific codes (this crate targets mill motion first).
 
 ### Example
 
 ```rust
-use swarf_gcode::{Interpreter, MotionSink, ResolvedMotionCommand};
+use swarf_gcode::{ErrorSink, Interpreter, InterpretError, LineOutput, OutputSink};
 
-// The interpreter pushes each resolved move into a sink you provide.
-// In real firmware this is the ring buffer; here it just prints.
-struct Echo;
-impl MotionSink for Echo {
-    fn push(&mut self, cmd: ResolvedMotionCommand) -> Result<(), ()> {
-        println!("{:?} -> {:?} @ {} mm/min", cmd.motion_mode, cmd.target, cmd.feed_rate);
+#[derive(Default)]
+struct Outputs(Vec<LineOutput>);
+impl OutputSink for Outputs {
+    fn push(&mut self, output: LineOutput) -> Result<(), ()> {
+        self.0.push(output);
         Ok(())
     }
 }
 
-fn main() {
-    let mut interp = Interpreter::new(Echo);
-    interp.run("G21 G90\nG0 X10 Y10\nG1 X20 Y20 F300\n");
+#[derive(Default)]
+struct Errors(Vec<InterpretError>);
+impl ErrorSink for Errors {
+    fn push(&mut self, error: InterpretError) {
+        self.0.push(error);
+    }
+}
 
-    for err in interp.take_errors() {
+fn main() {
+    let mut interp = Interpreter::new(Outputs::default(), Errors::default());
+    interp.run("G21 G90\nG0 X10 Y0\nM3 S1000\nG1 X20 F300\n");
+    let (outputs, errors) = interp.into_sinks();
+
+    // Motion and non-motion output share one sink, in the exact order
+    // the interpreter produced them - the G0, then the M3, then the G1.
+    for output in &outputs.0 {
+        println!("{output:?}");
+    }
+    for err in &errors.0 {
         eprintln!("error: {err:?}");
     }
 }
 ```
 
+For real-time / streaming use, feed the interpreter one line at a time with
+`Interpreter::step` instead of `run`ning a whole program at once — see its
+doc comment for the backpressure contract.
+
+A ready-to-run trace tool lives at `swarf-gcode/examples/trace.rs`: it prints
+a human-readable line-by-line trace of everything an interpreter run
+resolves, and ships with a set of real-world G-code test files under
+`swarf-gcode/examples/gcode_samples/` (third-party GPL-3.0 test data — see
+that directory's `NOTICE.md`) to try it against:
+
+```bash
+cd swarf-gcode
+cargo run --example trace -- examples/gcode_samples/arc_rword_test.gcode
+```
+
 ### Module map
 
-| Module          | Responsibility                                                       |
-| --------------- | -------------------------------------------------------------------- |
-| `state`         | `ModalState` — persistent, motion-scoped interpreter state           |
-| `modal_groups`  | NIST Table 4 modal-group classification + allocation-free conflict set |
-| `motion`        | `ResolvedMotionCommand` — the planner-facing output (owned snapshots) |
-| `visitor`       | `Interpreter` + the `MotionSink` boundary trait                      |
-
-### Scope
-
-In scope now: core motion semantics — modal state, modal-group conflict
-detection, G0/G1/G2/G3 motion modes, plane/units/distance modes, work offsets,
-feed rate.
-
-Deliberately **not** yet implemented (staged for later): parameter and
-expression evaluation (`#1`, `#<expr>`), canned cycles (G73, G81–G89), cutter
-compensation, tool-length offsets, arc center resolution from I/J/K/R, and
-rotary axes (A/B/C).
+| Module         | Responsibility                                                        |
+| -------------- | ---------------------------------------------------------------------|
+| `state`        | `ModalState` (Interface 1) — persistent, motion-scoped interpreter state |
+| `modal_groups` | NIST Table 4 modal-group classification + allocation-free conflict set |
+| `motion`       | `ResolvedMotionCommand` (Interface 2) — resolved moves, plus arc-center math |
+| `command`      | `Command` (Interface 3) — non-motion effects (spindle, coolant, tool change, dwell, program flow) |
+| `visitor`      | `Interpreter`, `OutputSink`/`LineOutput` (the combined output boundary), `ErrorSink` |
 
 ## Status & roadmap
 
-- Builds and passes its full test suite (21 tests) on a current Rust toolchain.
-- The interpreter is currently pinned to `gcode` 0.6 with a workaround for an
-  upstream line-grouping defect. The next major step is porting to `gcode`
-  0.7's zero-allocation visitor API, which removes that workaround, restores a
-  `no_std` build, and reshapes the entry point into the per-line *step
-  function* the architecture above calls for.
+- Builds `no_std`, no heap allocation anywhere, on `gcode` 0.7's
+  zero-allocation visitor API.
+- Passes its full test suite (74 tests + a doctest) on a current Rust
+  toolchain.
+- Next step: start **`swarf-motion`** (Tier A, the trajectory/planner stage)
+  consuming `swarf-gcode`'s `OutputSink` stream — arc interpolation and
+  canned-cycle-derived move sequencing are deliberately left rich/unflattened
+  in `swarf-gcode` specifically so this layer can own that work.
 
 ## Building
 
