@@ -3,9 +3,16 @@
 //! Parallel to `ResolvedMotionCommand` (Interface 2): a downstream
 //! consumer of moves shouldn't have to special-case "this thing has no
 //! target position" for spindle/coolant/tool-change/dwell/program-flow
-//! effects, so they get their own sink (`CommandSink`) and their own
-//! enum entirely, rather than being folded into `ResolvedMotionCommand`
-//! with a bunch of `Option` fields nobody but M-code handling needs.
+//! effects, so those effects get their own enum entirely, rather than
+//! being folded into `ResolvedMotionCommand` with a bunch of `Option`
+//! fields nobody but M-code handling needs.
+//!
+//! `Command` and `ResolvedMotionCommand` share one sink
+//! (`visitor::OutputSink`, via `visitor::LineOutput`) rather than each
+//! having their own - see that module's docs for why: a downstream
+//! real-time consumer needs to know exactly where a `Command` (e.g.
+//! "spindle on") falls relative to the surrounding moves, which two
+//! independent sinks can't express.
 //!
 //! Same invariant as `ResolvedMotionCommand`: every value here is an
 //! owned copy taken at the moment the line resolves, never a reference
@@ -68,9 +75,4 @@ pub enum Command {
     Dwell {
         seconds: f64,
     },
-}
-
-/// Sink for fully resolved non-motion commands - mirrors `MotionSink`.
-pub trait CommandSink {
-    fn push(&mut self, command: Command) -> Result<(), ()>;
 }

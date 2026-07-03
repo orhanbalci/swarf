@@ -9,8 +9,8 @@
 //! real state owner (`ModalState`):
 //!
 //!   - `Interpreter` (impl `ProgramVisitor`) owns `ModalState` and the
-//!     three output sinks (`MotionSink`, `CommandSink`, `ErrorSink`);
-//!     persists across the whole parse.
+//!     two output sinks (`OutputSink`, `ErrorSink`); persists across the
+//!     whole parse.
 //!   - `BlockCtx<'a>` (impl `BlockVisitor`) is per-line scratch: which
 //!     axis/word values were seen, which modal groups were touched this
 //!     line (for conflict detection), which non-motion effects were
@@ -38,13 +38,26 @@
 //! syntactically (e.g. `"G1 G91 X10"`: X is the line's target, not
 //! specifically G91's argument).
 //!
-//! # Non-motion output
+//! # One ordered output stream
 //!
-//! Spindle, coolant, tool change, dwell, and program-flow effects are
-//! resolved the same way as motion, but pushed to `CommandSink` as a
-//! `Command` (Interface 3, `command.rs`) instead of a
-//! `ResolvedMotionCommand` - see that module's docs for why they're a
-//! separate sink rather than folded into the motion stream.
+//! Motion (`ResolvedMotionCommand`, Interface 2) and non-motion effects
+//! (spindle, coolant, tool change, dwell, program flow - `Command`,
+//! Interface 3, `command.rs`) are resolved the same way, but pushed
+//! through the SAME `OutputSink` as a `LineOutput`, rather than to two
+//! independent sinks. A downstream real-time consumer needs to know
+//! exactly where, say, a spindle-on command falls relative to the
+//! surrounding moves; two separate sinks can't express that ordering at
+//! all, so this crate does not offer that split.
+//!
+//! # Real-time / streaming use
+//!
+//! `Interpreter::step` is the entry point for a caller that wants to
+//! feed this interpreter one line (or chunk) at a time - e.g. a
+//! real-time controller pulling lines from a serial buffer and pacing
+//! calls to `step` based on how much room its own downstream motion
+//! queue has. `ModalState` persists across calls, so this is exactly
+//! equivalent to calling `run` once on the concatenation of every
+//! chunk. See `step`'s docs for the backpressure contract.
 //!
 //! # Allocation
 //!
@@ -60,7 +73,7 @@ use gcode::core::{
     ProgramVisitor, Span, TokenType, Value,
 };
 
-use crate::command::{Command, CommandSink, CoolantCommand, ProgramFlow, SpindleCommand};
+use crate::command::{Command, CoolantCommand, ProgramFlow, SpindleCommand};
 use crate::modal_groups::{
     classify_general_code, classify_miscellaneous_code, ModalGroup, ModalGroupSet,
 };
@@ -108,6 +121,39 @@ pub enum InterpretError {
     /// 0.7's `Diagnostics` trait. Kept as a single variant carrying only
     /// a `Span` (not the offending text) to stay allocation-free.
     SyntaxError(Span),
+    /// A resolved output (a move or a non-motion command) could not be
+    /// pushed because `OutputSink::push` returned `Err` - the caller's
+    /// sink rejected it (e.g. a bounded downstream buffer was full).
+    /// The output is dropped; unlike every other variant here, this one
+    /// means real data was lost, not just "this line was invalid" - a
+    /// caller relying on `step` for real-time use should size its sink
+    /// to the worst case one line can produce so this never fires. See
+    /// this module's "Real-time / streaming use" docs.
+    OutputSinkFull,
+}
+
+/// One fully resolved piece of output from interpreting a line: either
+/// a move or a non-motion effect, in the exact order the interpreter
+/// produced them. See this module's "One ordered output stream" docs
+/// for why these share a sink instead of each having their own.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineOutput {
+    Motion(ResolvedMotionCommand),
+    Command(Command),
+}
+
+/// Sink for the interpreter's resolved output.
+pub trait OutputSink {
+    fn push(&mut self, output: LineOutput) -> Result<(), ()>;
+}
+
+/// Sink for interpretation errors - kept as a caller-supplied trait
+/// (mirroring `OutputSink`) rather than an internal `Vec`, so this
+/// crate never allocates: a `no_std` caller can log/count errors in
+/// place, while a `std` caller can still trivially collect them into a
+/// `Vec<InterpretError>` via their own sink implementation.
+pub trait ErrorSink {
+    fn push(&mut self, error: InterpretError);
 }
 
 /// Which stored reference position a G28/G30 (or G28.1/G30.1) line
@@ -132,50 +178,67 @@ struct CannedCycleWords {
     p: Option<f32>,
 }
 
-/// Sink for fully resolved motion commands.
-pub trait MotionSink {
-    fn push(&mut self, command: ResolvedMotionCommand) -> Result<(), ()>;
-}
-
-/// Sink for interpretation errors - kept as a caller-supplied trait
-/// (mirroring `MotionSink`) rather than an internal `Vec`, so this
-/// crate never allocates: a `no_std` caller can log/count errors in
-/// place, while a `std` caller can still trivially collect them into a
-/// `Vec<InterpretError>` via their own sink implementation.
-pub trait ErrorSink {
-    fn push(&mut self, error: InterpretError);
-}
-
 /// The interpreter. Owns the one persistent piece of state
-/// (`ModalState`), a motion sink, a non-motion command sink, and an
-/// error sink.
-pub struct Interpreter<M: MotionSink, C: CommandSink, E: ErrorSink> {
+/// (`ModalState`), one ordered output sink, and an error sink.
+pub struct Interpreter<O: OutputSink, E: ErrorSink> {
     pub state: ModalState,
-    sink: M,
-    commands: C,
+    sink: O,
     errors: E,
 }
 
-impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
-    pub fn new(sink: M, commands: C, errors: E) -> Self {
+impl<O: OutputSink, E: ErrorSink> Interpreter<O, E> {
+    pub fn new(sink: O, errors: E) -> Self {
         Self {
             state: ModalState::new(),
             sink,
-            commands,
             errors,
         }
     }
 
-    /// Parse and interpret an entire source string.
+    /// Parse and interpret an entire source string in one call.
+    /// Convenient for batch use (tests, offline post-processing of a
+    /// whole file). For real-time/streaming use where a caller wants to
+    /// control pacing line by line, see `step`.
     pub fn run(&mut self, src: &str) {
         parse(src, self);
+    }
+
+    /// Parse and interpret one chunk of G-code (typically a single
+    /// line) immediately and synchronously, updating persistent state
+    /// and pushing output as it resolves. Intended for real-time /
+    /// streaming use: the caller drives pacing by choosing when to call
+    /// `step` again (e.g. only once its downstream motion queue has
+    /// room for another line's worth of output). `ModalState` persists
+    /// across calls, so calling `step` once per line is equivalent to a
+    /// single `run` over the concatenation of every chunk.
+    ///
+    /// Backpressure contract: `gcode` 0.7's parser only supports
+    /// pausing between blocks (lines), not mid-line, so `chunk` should
+    /// end at a line boundary - don't split one line across two `step`
+    /// calls. If a single line produces more output than the sink can
+    /// accept, the excess is reported as `InterpretError::OutputSinkFull`
+    /// rather than silently dropped; size the sink for the worst case
+    /// one line can produce (bounded in practice - e.g. G28 emits at
+    /// most 2, a realistic G83 peck sequence a handful) to avoid this.
+    pub fn step(&mut self, chunk: &str) {
+        self.run(chunk);
     }
 
     /// Consume the interpreter, handing back the sinks it was built
     /// with - typically to inspect what a `std`-based test/caller
     /// collected into them.
-    pub fn into_sinks(self) -> (M, C, E) {
-        (self.sink, self.commands, self.errors)
+    pub fn into_sinks(self) -> (O, E) {
+        (self.sink, self.errors)
+    }
+
+    /// Push one resolved output, surfacing a rejecting sink as
+    /// `InterpretError::OutputSinkFull` rather than silently discarding
+    /// it - every other push site in this module goes through here
+    /// instead of calling `self.sink.push` directly.
+    fn emit(&mut self, output: LineOutput) {
+        if self.sink.push(output).is_err() {
+            self.errors.push(InterpretError::OutputSinkFull);
+        }
     }
 
     /// Resolve one axis word against `current` (the position to fall
@@ -230,25 +293,25 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
     /// rate field (meaningless for rapids, kept for
     /// `ResolvedMotionCommand` field uniformity - see its docs).
     fn push_rapid(&mut self, start: Position, target: Position) {
-        let _ = self.sink.push(ResolvedMotionCommand {
+        self.emit(LineOutput::Motion(ResolvedMotionCommand {
             start,
             target,
             motion_mode: MotionMode::Rapid,
             arc: None,
             feed_rate: self.state.feed_rate,
-        });
+        }));
     }
 
     /// Push a linear (feed-rate-coordinated) move from `start` to
     /// `target`.
     fn push_linear(&mut self, start: Position, target: Position) {
-        let _ = self.sink.push(ResolvedMotionCommand {
+        self.emit(LineOutput::Motion(ResolvedMotionCommand {
             start,
             target,
             motion_mode: MotionMode::Linear,
             arc: None,
             feed_rate: self.state.feed_rate,
-        });
+        }));
     }
 
     /// Execute one canned-cycle hole: resolve the hole's X/Y and the
@@ -384,10 +447,10 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
                     .canned_cycle
                     .p
                     .ok_or(InterpretError::CannedCycleMissingParameter)?;
-                let _ = self.commands.push(Command::Dwell { seconds });
+                self.emit(LineOutput::Command(Command::Dwell { seconds }));
             }
             MotionMode::BoreSpindleStop => {
-                let _ = self.commands.push(Command::Spindle(SpindleCommand::Stop));
+                self.emit(LineOutput::Command(Command::Spindle(SpindleCommand::Stop)));
             }
             _ => {}
         }
@@ -420,7 +483,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> Interpreter<M, C, E> {
     }
 }
 
-impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for Interpreter<M, C, E> {
+impl<O: OutputSink, E: ErrorSink> CoreDiagnostics for Interpreter<O, E> {
     fn emit_unknown_content(&mut self, _text: &str, span: Span) {
         self.errors.push(InterpretError::SyntaxError(span));
     }
@@ -441,7 +504,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for Interprete
     }
 }
 
-impl<M: MotionSink, C: CommandSink, E: ErrorSink> ProgramVisitor for Interpreter<M, C, E> {
+impl<O: OutputSink, E: ErrorSink> ProgramVisitor for Interpreter<O, E> {
     fn start_block(&mut self) -> ControlFlow<impl BlockVisitor + '_> {
         ControlFlow::Continue(BlockCtx {
             interp: self,
@@ -481,8 +544,8 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> ProgramVisitor for Interpreter
 /// of some command), and which non-motion effects (dwell, program flow,
 /// spindle, coolant, tool change/select) were requested. Borrows the
 /// one real state owner, `Interpreter`.
-struct BlockCtx<'a, M: MotionSink, C: CommandSink, E: ErrorSink> {
-    interp: &'a mut Interpreter<M, C, E>,
+struct BlockCtx<'a, O: OutputSink, E: ErrorSink> {
+    interp: &'a mut Interpreter<O, E>,
     seen_groups: ModalGroupSet,
     resolved_mode: Option<MotionMode>,
     x: Option<f32>,
@@ -536,7 +599,7 @@ struct BlockCtx<'a, M: MotionSink, C: CommandSink, E: ErrorSink> {
     machine_coordinates: bool,
 }
 
-impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockCtx<'_, M, C, E> {
+impl<O: OutputSink, E: ErrorSink> BlockCtx<'_, O, E> {
     /// Record an X/Y/Z/F/P/S value into this line's shared pool,
     /// rejecting (with `UnsupportedSyntax`) anything that isn't a
     /// literal number - parameters/expressions are out of scope, see
@@ -573,7 +636,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockCtx<'_, M, C, E> {
     }
 }
 
-impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for BlockCtx<'_, M, C, E> {
+impl<O: OutputSink, E: ErrorSink> CoreDiagnostics for BlockCtx<'_, O, E> {
     fn emit_unknown_content(&mut self, text: &str, span: Span) {
         self.interp.emit_unknown_content(text, span);
     }
@@ -587,7 +650,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for BlockCtx<'
     }
 }
 
-impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, M, C, E> {
+impl<O: OutputSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, O, E> {
     fn word_address(&mut self, letter: char, value: Value<'_>, _span: Span) {
         self.record_axis(letter, value);
     }
@@ -837,7 +900,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                 self.interp.state.position = target;
                 self.interp.state.motion_mode = effective_mode;
 
-                let _ = self.interp.sink.push(command);
+                self.interp.emit(LineOutput::Motion(command));
             }
         }
 
@@ -852,7 +915,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                 4 => SpindleCommand::CounterClockwise(speed),
                 _ => SpindleCommand::Stop, // M5
             };
-            let _ = self.interp.commands.push(Command::Spindle(cmd));
+            self.interp.emit(LineOutput::Command(Command::Spindle(cmd)));
         }
 
         if let Some(major) = self.coolant_word {
@@ -861,7 +924,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                 8 => CoolantCommand::Flood,
                 _ => CoolantCommand::Off, // M9
             };
-            let _ = self.interp.commands.push(Command::Coolant(cmd));
+            self.interp.emit(LineOutput::Command(Command::Coolant(cmd)));
         }
 
         if let Some(major) = self.program_flow {
@@ -871,7 +934,8 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                 2 => ProgramFlow::End,
                 _ => ProgramFlow::EndAndRewind, // M30
             };
-            let _ = self.interp.commands.push(Command::ProgramFlow(flow));
+            self.interp
+                .emit(LineOutput::Command(Command::ProgramFlow(flow)));
         }
 
         if self.tool_select.is_some() {
@@ -880,13 +944,15 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
 
         if self.dwell_requested {
             let seconds = self.p.unwrap_or(0.0) as f64;
-            let _ = self.interp.commands.push(Command::Dwell { seconds });
+            self.interp
+                .emit(LineOutput::Command(Command::Dwell { seconds }));
         }
 
         if self.tool_change_requested {
             match self.interp.state.selected_tool {
                 Some(tool) => {
-                    let _ = self.interp.commands.push(Command::ToolChange { tool });
+                    self.interp
+                        .emit(LineOutput::Command(Command::ToolChange { tool }));
                 }
                 None => self.interp.errors.push(InterpretError::NoToolSelected),
             }
@@ -933,13 +999,13 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                 let intermediate = self
                     .interp
                     .resolve_target_from_values(self.x, self.y, self.z, false);
-                let _ = self.interp.sink.push(ResolvedMotionCommand {
+                self.interp.emit(LineOutput::Motion(ResolvedMotionCommand {
                     start: leg_start,
                     target: intermediate,
                     motion_mode: MotionMode::Rapid,
                     arc: None,
                     feed_rate: self.interp.state.feed_rate,
-                });
+                }));
                 self.interp.state.position = intermediate;
                 leg_start = intermediate;
             }
@@ -948,13 +1014,13 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
                 HomeReference::G28 => self.interp.state.g28_position,
                 HomeReference::G30 => self.interp.state.g30_position,
             };
-            let _ = self.interp.sink.push(ResolvedMotionCommand {
+            self.interp.emit(LineOutput::Motion(ResolvedMotionCommand {
                 start: leg_start,
                 target: reference_position,
                 motion_mode: MotionMode::Rapid,
                 arc: None,
                 feed_rate: self.interp.state.feed_rate,
-            });
+            }));
             self.interp.state.position = reference_position;
         }
 
@@ -972,11 +1038,11 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, 
 /// following a `G1`, or the `S1000` following an `M3`) are pooled into
 /// the line's data exactly like a bare `word_address` would be, per
 /// NIST's line-is-the-unit semantics (see this module's docs).
-struct CommandCtx<'a, 'b, M: MotionSink, C: CommandSink, E: ErrorSink> {
-    block: &'a mut BlockCtx<'b, M, C, E>,
+struct CommandCtx<'a, 'b, O: OutputSink, E: ErrorSink> {
+    block: &'a mut BlockCtx<'b, O, E>,
 }
 
-impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for CommandCtx<'_, '_, M, C, E> {
+impl<O: OutputSink, E: ErrorSink> CoreDiagnostics for CommandCtx<'_, '_, O, E> {
     fn emit_unknown_content(&mut self, text: &str, span: Span) {
         self.block.emit_unknown_content(text, span);
     }
@@ -990,7 +1056,7 @@ impl<M: MotionSink, C: CommandSink, E: ErrorSink> CoreDiagnostics for CommandCtx
     }
 }
 
-impl<M: MotionSink, C: CommandSink, E: ErrorSink> CommandVisitor for CommandCtx<'_, '_, M, C, E> {
+impl<O: OutputSink, E: ErrorSink> CommandVisitor for CommandCtx<'_, '_, O, E> {
     fn argument(&mut self, letter: char, value: Value<'_>, _span: Span) {
         self.block.record_axis(letter, value);
     }
@@ -1003,26 +1069,36 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct CollectingSink {
-        commands: std::vec::Vec<ResolvedMotionCommand>,
+    struct CollectingOutput {
+        outputs: std::vec::Vec<LineOutput>,
     }
 
-    impl MotionSink for CollectingSink {
-        fn push(&mut self, command: ResolvedMotionCommand) -> Result<(), ()> {
-            self.commands.push(command);
+    impl OutputSink for CollectingOutput {
+        fn push(&mut self, output: LineOutput) -> Result<(), ()> {
+            self.outputs.push(output);
             Ok(())
         }
     }
 
-    #[derive(Default)]
-    struct CollectingCommands {
-        commands: std::vec::Vec<Command>,
-    }
+    impl CollectingOutput {
+        fn motion(&self) -> std::vec::Vec<ResolvedMotionCommand> {
+            self.outputs
+                .iter()
+                .filter_map(|o| match o {
+                    LineOutput::Motion(m) => Some(*m),
+                    LineOutput::Command(_) => None,
+                })
+                .collect()
+        }
 
-    impl CommandSink for CollectingCommands {
-        fn push(&mut self, command: Command) -> Result<(), ()> {
-            self.commands.push(command);
-            Ok(())
+        fn commands(&self) -> std::vec::Vec<Command> {
+            self.outputs
+                .iter()
+                .filter_map(|o| match o {
+                    LineOutput::Command(c) => Some(*c),
+                    LineOutput::Motion(_) => None,
+                })
+                .collect()
         }
     }
 
@@ -1037,21 +1113,18 @@ mod tests {
         }
     }
 
-    fn run(src: &str) -> (CollectingSink, CollectingCommands, CollectingErrors) {
-        let mut interp = Interpreter::new(
-            CollectingSink::default(),
-            CollectingCommands::default(),
-            CollectingErrors::default(),
-        );
+    fn run(src: &str) -> (CollectingOutput, CollectingErrors) {
+        let mut interp = Interpreter::new(CollectingOutput::default(), CollectingErrors::default());
         interp.run(src);
         interp.into_sinks()
     }
 
     #[test]
     fn simple_linear_move_resolves_to_one_command() {
-        let (sink, _, _) = run("G1 X10 Y20\n");
-        assert_eq!(sink.commands.len(), 1);
-        let cmd = sink.commands[0];
+        let (output, _) = run("G1 X10 Y20\n");
+        let motion = output.motion();
+        assert_eq!(motion.len(), 1);
+        let cmd = motion[0];
         assert_eq!(cmd.motion_mode, MotionMode::Linear);
         assert_eq!(cmd.target.x, 10.0);
         assert_eq!(cmd.target.y, 20.0);
@@ -1060,62 +1133,67 @@ mod tests {
 
     #[test]
     fn modal_carry_forward_reuses_previous_motion_mode() {
-        let (sink, _, _) = run("G1 X10\nY20\n");
-        assert_eq!(sink.commands.len(), 2);
-        assert_eq!(sink.commands[1].motion_mode, MotionMode::Linear);
-        assert_eq!(sink.commands[1].target.y, 20.0);
-        assert_eq!(sink.commands[1].target.x, 10.0);
+        let (output, _) = run("G1 X10\nY20\n");
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
+        assert_eq!(motion[1].motion_mode, MotionMode::Linear);
+        assert_eq!(motion[1].target.y, 20.0);
+        assert_eq!(motion[1].target.x, 10.0);
     }
 
     #[test]
     fn bare_axis_words_before_any_command_have_no_active_motion_mode() {
-        let (sink, _, errors) = run("X10\n");
-        assert_eq!(sink.commands.len(), 0);
+        let (output, errors) = run("X10\n");
+        assert_eq!(output.motion().len(), 0);
         assert!(errors.errors.contains(&InterpretError::NoActiveMotionMode));
     }
 
     #[test]
     fn incremental_distance_mode_adds_to_current_position() {
-        let (sink, _, _) = run("G1 G91 X10\nX10\n");
-        assert_eq!(sink.commands.len(), 2);
-        assert_eq!(sink.commands[0].target.x, 10.0);
-        assert_eq!(sink.commands[1].target.x, 20.0);
+        let (output, _) = run("G1 G91 X10\nX10\n");
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
+        assert_eq!(motion[0].target.x, 10.0);
+        assert_eq!(motion[1].target.x, 20.0);
     }
 
     #[test]
     fn conflicting_motion_words_on_one_line_is_detected() {
-        let (_, _, errors) = run("G0 G1 X10\n");
+        let (_, errors) = run("G0 G1 X10\n");
         assert!(errors.errors.contains(&InterpretError::ModalGroupConflict));
     }
 
     #[test]
     fn plane_and_motion_words_coexist_without_conflict() {
-        let (sink, _, errors) = run("G17 G1 X10\n");
+        let (output, errors) = run("G17 G1 X10\n");
         assert!(!errors.errors.contains(&InterpretError::ModalGroupConflict));
-        assert_eq!(sink.commands.len(), 1);
+        assert_eq!(output.motion().len(), 1);
     }
 
     #[test]
     fn units_conversion_applies_to_subsequent_literals() {
-        let (sink, _, _) = run("G20 G1 X1\n");
-        assert_eq!(sink.commands.len(), 1);
-        assert!((sink.commands[0].target.x - 25.4).abs() < 1e-6);
+        let (output, _) = run("G20 G1 X1\n");
+        let motion = output.motion();
+        assert_eq!(motion.len(), 1);
+        assert!((motion[0].target.x - 25.4).abs() < 1e-6);
     }
 
     #[test]
     fn rapid_and_linear_are_distinct_modes_in_output() {
-        let (sink, _, _) = run("G0 X5\nG1 X10\n");
-        assert_eq!(sink.commands.len(), 2);
-        assert_eq!(sink.commands[0].motion_mode, MotionMode::Rapid);
-        assert_eq!(sink.commands[1].motion_mode, MotionMode::Linear);
+        let (output, _) = run("G0 X5\nG1 X10\n");
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
+        assert_eq!(motion[0].motion_mode, MotionMode::Rapid);
+        assert_eq!(motion[1].motion_mode, MotionMode::Linear);
     }
 
     #[test]
     fn multiple_lines_accumulate_position_correctly() {
-        let (sink, _, _) = run("G1 X10 Y0\nX20 Y10\nX0 Y0\n");
-        assert_eq!(sink.commands.len(), 3);
+        let (output, _) = run("G1 X10 Y0\nX20 Y10\nX0 Y0\n");
+        let motion = output.motion();
+        assert_eq!(motion.len(), 3);
         assert_eq!(
-            sink.commands[0].target,
+            motion[0].target,
             Position {
                 x: 10.0,
                 y: 0.0,
@@ -1123,7 +1201,7 @@ mod tests {
             }
         );
         assert_eq!(
-            sink.commands[1].target,
+            motion[1].target,
             Position {
                 x: 20.0,
                 y: 10.0,
@@ -1131,7 +1209,7 @@ mod tests {
             }
         );
         assert_eq!(
-            sink.commands[2].target,
+            motion[2].target,
             Position {
                 x: 0.0,
                 y: 0.0,
@@ -1151,8 +1229,8 @@ mod tests {
         // `Value::Variable` handling in `record_axis` is kept as
         // forward-compatible dead code for if/when a future `gcode`
         // release actually implements parameter parsing.
-        let (sink, _, errors) = run("G1 X#1\n");
-        assert!(sink.commands.is_empty());
+        let (output, errors) = run("G1 X#1\n");
+        assert!(output.motion().is_empty());
         assert!(!errors.errors.is_empty());
         assert!(errors
             .errors
@@ -1162,18 +1240,18 @@ mod tests {
 
     #[test]
     fn spindle_on_with_speed_is_resolved() {
-        let (_, commands, _) = run("M3 S1000\n");
+        let (output, _) = run("M3 S1000\n");
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![Command::Spindle(SpindleCommand::Clockwise(1000.0))]
         );
     }
 
     #[test]
     fn spindle_speed_is_modal_across_lines() {
-        let (_, commands, _) = run("S500\nM3\nM5\nM4\n");
+        let (output, _) = run("S500\nM3\nM5\nM4\n");
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![
                 Command::Spindle(SpindleCommand::Clockwise(500.0)),
                 Command::Spindle(SpindleCommand::Stop),
@@ -1184,9 +1262,9 @@ mod tests {
 
     #[test]
     fn coolant_commands_are_resolved() {
-        let (_, commands, _) = run("M8\nM9\n");
+        let (output, _) = run("M8\nM9\n");
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![
                 Command::Coolant(CoolantCommand::Flood),
                 Command::Coolant(CoolantCommand::Off),
@@ -1196,18 +1274,18 @@ mod tests {
 
     #[test]
     fn dwell_reads_p_word_in_seconds() {
-        let (_, commands, _) = run("G4 P1.5\n");
+        let (output, _) = run("G4 P1.5\n");
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![Command::Dwell { seconds: 1.5 }]
         );
     }
 
     #[test]
     fn program_flow_codes_are_resolved() {
-        let (_, commands, _) = run("M0\nM1\nM2\nM30\n");
+        let (output, _) = run("M0\nM1\nM2\nM30\n");
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![
                 Command::ProgramFlow(ProgramFlow::Stop),
                 Command::ProgramFlow(ProgramFlow::OptionalStop),
@@ -1219,36 +1297,92 @@ mod tests {
 
     #[test]
     fn tool_select_then_change_resolves_with_selected_tool_number() {
-        let (_, commands, _) = run("T4\nM6\n");
+        let (output, _) = run("T4\nM6\n");
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![Command::ToolChange { tool: 4 }]
         );
     }
 
     #[test]
     fn tool_change_without_prior_selection_is_an_error() {
-        let (_, commands, errors) = run("M6\n");
-        assert!(commands.commands.is_empty());
+        let (output, errors) = run("M6\n");
+        assert!(output.commands().is_empty());
         assert!(errors.errors.contains(&InterpretError::NoToolSelected));
     }
 
     #[test]
     fn tool_select_and_change_on_the_same_line_resolves_immediately() {
-        let (_, commands, _) = run("T5 M6\n");
+        let (output, _) = run("T5 M6\n");
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![Command::ToolChange { tool: 5 }]
         );
+    }
+
+    #[test]
+    fn motion_and_commands_preserve_relative_order() {
+        // The whole point of a single combined sink: a downstream
+        // real-time consumer can see that the spindle turned on BEFORE
+        // the move, and off AFTER it - two separate sinks couldn't
+        // express this relative ordering at all.
+        let (output, errors) = run("M3 S1000\nG1 X10\nM5\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(
+            output.outputs,
+            std::vec![
+                LineOutput::Command(Command::Spindle(SpindleCommand::Clockwise(1000.0))),
+                LineOutput::Motion(ResolvedMotionCommand {
+                    start: Position::default(),
+                    target: Position {
+                        x: 10.0,
+                        y: 0.0,
+                        z: 0.0
+                    },
+                    motion_mode: MotionMode::Linear,
+                    arc: None,
+                    feed_rate: 0.0,
+                }),
+                LineOutput::Command(Command::Spindle(SpindleCommand::Stop)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rejecting_sink_surfaces_output_sink_full_instead_of_dropping_silently() {
+        struct RejectingSink;
+        impl OutputSink for RejectingSink {
+            fn push(&mut self, _output: LineOutput) -> Result<(), ()> {
+                Err(())
+            }
+        }
+
+        let mut interp = Interpreter::new(RejectingSink, CollectingErrors::default());
+        interp.run("G1 X10\n");
+        let (_, errors) = interp.into_sinks();
+        assert!(errors.errors.contains(&InterpretError::OutputSinkFull));
+    }
+
+    #[test]
+    fn step_behaves_identically_to_a_single_run_over_the_concatenation() {
+        let mut interp = Interpreter::new(CollectingOutput::default(), CollectingErrors::default());
+        interp.step("G1 X10\n");
+        interp.step("X20\n");
+        let (output, errors) = interp.into_sinks();
+        assert!(errors.errors.is_empty());
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
+        assert_eq!(motion[0].target.x, 10.0);
+        assert_eq!(motion[1].target.x, 20.0);
     }
 
     #[test]
     fn ccw_arc_by_radius_resolves_the_minor_arc_center() {
         // Worked example (see motion.rs docs): quarter circle from
         // (10,0) to (0,10), r=10. CCW's minor-arc center is the origin.
-        let (sink, _, errors) = run("G0 X10 Y0\nG3 X0 Y10 R10\n");
+        let (output, errors) = run("G0 X10 Y0\nG3 X0 Y10 R10\n");
         assert!(errors.errors.is_empty());
-        let arc = sink.commands[1].arc.expect("arc geometry");
+        let arc = output.motion()[1].arc.expect("arc geometry");
         assert!((arc.center.x - 0.0).abs() < 1e-9);
         assert!((arc.center.y - 0.0).abs() < 1e-9);
     }
@@ -1257,28 +1391,29 @@ mod tests {
     fn cw_arc_by_radius_resolves_the_other_minor_arc_center() {
         // Same chord, opposite direction: CW's minor-arc center is
         // (10,10), not the origin - see motion.rs's worked example.
-        let (sink, _, errors) = run("G0 X10 Y0\nG2 X0 Y10 R10\n");
+        let (output, errors) = run("G0 X10 Y0\nG2 X0 Y10 R10\n");
         assert!(errors.errors.is_empty());
-        let arc = sink.commands[1].arc.expect("arc geometry");
+        let arc = output.motion()[1].arc.expect("arc geometry");
         assert!((arc.center.x - 10.0).abs() < 1e-9);
         assert!((arc.center.y - 10.0).abs() < 1e-9);
     }
 
     #[test]
     fn arc_by_ijk_center_is_start_plus_offset() {
-        let (sink, _, errors) = run("G2 X10 Y0 I5 J0\n");
+        let (output, errors) = run("G2 X10 Y0 I5 J0\n");
         assert!(errors.errors.is_empty());
-        let arc = sink.commands[0].arc.expect("arc geometry");
+        let arc = output.motion()[0].arc.expect("arc geometry");
         assert_eq!(arc.center.x, 5.0);
         assert_eq!(arc.center.y, 0.0);
     }
 
     #[test]
     fn full_circle_via_ijk_with_no_axis_words_targets_the_start_point() {
-        let (sink, _, errors) = run("G0 X10 Y0\nG2 I-10 J0\n");
+        let (output, errors) = run("G0 X10 Y0\nG2 I-10 J0\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 2);
-        let full_circle = sink.commands[1];
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
+        let full_circle = motion[1];
         assert_eq!(full_circle.target, full_circle.start);
         let arc = full_circle.arc.expect("arc geometry");
         assert!((arc.center.x - 0.0).abs() < 1e-9);
@@ -1287,8 +1422,8 @@ mod tests {
 
     #[test]
     fn arc_with_neither_ijk_nor_r_is_a_missing_geometry_error() {
-        let (sink, _, errors) = run("G2 X10 Y0\n");
-        assert!(sink.commands.is_empty());
+        let (output, errors) = run("G2 X10 Y0\n");
+        assert!(output.motion().is_empty());
         assert!(errors
             .errors
             .contains(&InterpretError::InvalidArc(ArcError::MissingGeometry)));
@@ -1298,8 +1433,8 @@ mod tests {
     fn radius_smaller_than_half_the_chord_is_an_error() {
         // Chord length is 10; no circle of radius 1 passes through
         // points 10 apart.
-        let (sink, _, errors) = run("G2 X10 Y0 R1\n");
-        assert!(sink.commands.is_empty());
+        let (output, errors) = run("G2 X10 Y0 R1\n");
+        assert!(output.motion().is_empty());
         assert!(errors
             .errors
             .contains(&InterpretError::InvalidArc(ArcError::RadiusTooSmall)));
@@ -1307,8 +1442,8 @@ mod tests {
 
     #[test]
     fn radius_form_with_coincident_start_and_end_is_an_error() {
-        let (sink, _, errors) = run("G2 R5\n");
-        assert!(sink.commands.is_empty());
+        let (output, errors) = run("G2 R5\n");
+        assert!(output.motion().is_empty());
         assert!(errors
             .errors
             .contains(&InterpretError::InvalidArc(ArcError::CoincidentEndpoints)));
@@ -1316,36 +1451,36 @@ mod tests {
 
     #[test]
     fn ccw_arc_in_zx_plane_uses_the_same_cyclic_convention_as_xy() {
-        let (sink, _, errors) = run("G18\nG0 Z10 X0\nG3 Z0 X10 R10\n");
+        let (output, errors) = run("G18\nG0 Z10 X0\nG3 Z0 X10 R10\n");
         assert!(errors.errors.is_empty());
-        let ccw = sink.commands[1].arc.expect("arc geometry");
+        let ccw = output.motion()[1].arc.expect("arc geometry");
         assert!((ccw.center.z - 0.0).abs() < 1e-9);
         assert!((ccw.center.x - 0.0).abs() < 1e-9);
     }
 
     #[test]
     fn cw_arc_in_zx_plane_uses_the_same_cyclic_convention_as_xy() {
-        let (sink, _, errors) = run("G18\nG0 Z10 X0\nG2 Z0 X10 R10\n");
+        let (output, errors) = run("G18\nG0 Z10 X0\nG2 Z0 X10 R10\n");
         assert!(errors.errors.is_empty());
-        let cw = sink.commands[1].arc.expect("arc geometry");
+        let cw = output.motion()[1].arc.expect("arc geometry");
         assert!((cw.center.z - 10.0).abs() < 1e-9);
         assert!((cw.center.x - 10.0).abs() < 1e-9);
     }
 
     #[test]
     fn ccw_arc_in_yz_plane_uses_the_same_cyclic_convention_as_xy() {
-        let (sink, _, errors) = run("G19\nG0 Y10 Z0\nG3 Y0 Z10 R10\n");
+        let (output, errors) = run("G19\nG0 Y10 Z0\nG3 Y0 Z10 R10\n");
         assert!(errors.errors.is_empty());
-        let ccw = sink.commands[1].arc.expect("arc geometry");
+        let ccw = output.motion()[1].arc.expect("arc geometry");
         assert!((ccw.center.y - 0.0).abs() < 1e-9);
         assert!((ccw.center.z - 0.0).abs() < 1e-9);
     }
 
     #[test]
     fn cw_arc_in_yz_plane_uses_the_same_cyclic_convention_as_xy() {
-        let (sink, _, errors) = run("G19\nG0 Y10 Z0\nG2 Y0 Z10 R10\n");
+        let (output, errors) = run("G19\nG0 Y10 Z0\nG2 Y0 Z10 R10\n");
         assert!(errors.errors.is_empty());
-        let cw = sink.commands[1].arc.expect("arc geometry");
+        let cw = output.motion()[1].arc.expect("arc geometry");
         assert!((cw.center.y - 10.0).abs() < 1e-9);
         assert!((cw.center.z - 10.0).abs() < 1e-9);
     }
@@ -1356,12 +1491,8 @@ mod tests {
     fn run_with_offsets(
         offsets: &[(CoordinateSystem, Position)],
         src: &str,
-    ) -> (CollectingSink, CollectingCommands, CollectingErrors) {
-        let mut interp = Interpreter::new(
-            CollectingSink::default(),
-            CollectingCommands::default(),
-            CollectingErrors::default(),
-        );
+    ) -> (CollectingOutput, CollectingErrors) {
+        let mut interp = Interpreter::new(CollectingOutput::default(), CollectingErrors::default());
         for &(system, offset) in offsets {
             interp.state.set_coordinate_system_offset(system, offset);
         }
@@ -1371,7 +1502,7 @@ mod tests {
 
     #[test]
     fn selecting_a_coordinate_system_applies_its_offset_to_absolute_moves() {
-        let (sink, _, errors) = run_with_offsets(
+        let (output, errors) = run_with_offsets(
             &[(
                 CoordinateSystem::G55,
                 Position {
@@ -1383,53 +1514,58 @@ mod tests {
             "G55 G1 X10 Y0\n",
         );
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands[0].target.x, 110.0);
-        assert_eq!(sink.commands[0].target.y, 50.0);
+        let motion = output.motion();
+        assert_eq!(motion[0].target.x, 110.0);
+        assert_eq!(motion[0].target.y, 50.0);
     }
 
     #[test]
     fn default_coordinate_system_is_g54_with_no_offset() {
-        let (sink, _, errors) = run("G1 X10 Y0\n");
+        let (output, errors) = run("G1 X10 Y0\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands[0].target.x, 10.0);
+        assert_eq!(output.motion()[0].target.x, 10.0);
     }
 
     #[test]
     fn g92_shifts_subsequent_absolute_moves() {
         // At machine position (10,0), G92 X0 declares "here is X=0" -
         // subsequent absolute moves are shifted by -10 to compensate.
-        let (sink, _, errors) = run("G0 X10\nG92 X0\nG1 X5\n");
+        let (output, errors) = run("G0 X10\nG92 X0\nG1 X5\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 2);
-        assert_eq!(sink.commands[1].target.x, 15.0);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
+        assert_eq!(motion[1].target.x, 15.0);
     }
 
     #[test]
     fn g92_does_not_itself_move_the_machine() {
-        let (sink, _, errors) = run("G0 X10\nG92 X0\n");
+        let (output, errors) = run("G0 X10\nG92 X0\n");
         assert!(errors.errors.is_empty());
         // Only the G0 move produced a command - G92 must not be
         // misread as a bare axis-word move using the carried G0 mode.
-        assert_eq!(sink.commands.len(), 1);
-        assert_eq!(sink.commands[0].target.x, 10.0);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 1);
+        assert_eq!(motion[0].target.x, 10.0);
     }
 
     #[test]
     fn g92_only_shifts_the_axes_it_names() {
-        let (sink, _, errors) = run("G0 X10 Y20\nG92 X0\nG1 X5 Y20\n");
+        let (output, errors) = run("G0 X10 Y20\nG92 X0\nG1 X5 Y20\n");
         assert!(errors.errors.is_empty());
         // X was redefined (shift -10); Y was not (shift 0).
-        assert_eq!(sink.commands[1].target.x, 15.0);
-        assert_eq!(sink.commands[1].target.y, 20.0);
+        let motion = output.motion();
+        assert_eq!(motion[1].target.x, 15.0);
+        assert_eq!(motion[1].target.y, 20.0);
     }
 
     #[test]
     fn g92_1_cancels_the_offset() {
-        let (sink, _, errors) = run("G0 X10\nG92 X0\nG92.1\nG1 X5\n");
+        let (output, errors) = run("G0 X10\nG92 X0\nG92.1\nG1 X5\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 2);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
         // With the G92 shift cancelled, X5 is just X5 again.
-        assert_eq!(sink.commands[1].target.x, 5.0);
+        assert_eq!(motion[1].target.x, 5.0);
     }
 
     /// Like `run`, but lets a test configure `ModalState` (e.g. preload
@@ -1438,12 +1574,8 @@ mod tests {
     fn run_configured(
         configure: impl FnOnce(&mut ModalState),
         src: &str,
-    ) -> (CollectingSink, CollectingCommands, CollectingErrors) {
-        let mut interp = Interpreter::new(
-            CollectingSink::default(),
-            CollectingCommands::default(),
-            CollectingErrors::default(),
-        );
+    ) -> (CollectingOutput, CollectingErrors) {
+        let mut interp = Interpreter::new(CollectingOutput::default(), CollectingErrors::default());
         configure(&mut interp.state);
         interp.run(src);
         interp.into_sinks()
@@ -1451,7 +1583,7 @@ mod tests {
 
     #[test]
     fn g28_with_axis_words_moves_through_intermediate_point_then_home() {
-        let (sink, _, errors) = run_configured(
+        let (output, errors) = run_configured(
             |state| {
                 state.g28_position = Position {
                     x: 0.0,
@@ -1462,15 +1594,16 @@ mod tests {
             "G0 X10 Y0\nG28 Z20\n",
         );
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 3);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 3);
         // Intermediate leg: rapid to Z20, keeping X/Y from before.
-        let intermediate = sink.commands[1];
+        let intermediate = motion[1];
         assert_eq!(intermediate.motion_mode, MotionMode::Rapid);
         assert_eq!(intermediate.target.x, 10.0);
         assert_eq!(intermediate.target.z, 20.0);
         // Final leg: rapid from the intermediate point to the stored
         // G28 reference position (raw machine coordinates).
-        let home = sink.commands[2];
+        let home = motion[2];
         assert_eq!(home.start, intermediate.target);
         assert_eq!(home.target.x, 0.0);
         assert_eq!(home.target.z, 50.0);
@@ -1478,7 +1611,7 @@ mod tests {
 
     #[test]
     fn g28_with_no_axis_words_goes_directly_to_reference() {
-        let (sink, _, errors) = run_configured(
+        let (output, errors) = run_configured(
             |state| {
                 state.g28_position = Position {
                     x: 1.0,
@@ -1491,9 +1624,10 @@ mod tests {
         assert!(errors.errors.is_empty());
         // Only two commands: the initial G0, then straight to home - no
         // intermediate leg, since no axis words were given.
-        assert_eq!(sink.commands.len(), 2);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
         assert_eq!(
-            sink.commands[1].target,
+            motion[1].target,
             Position {
                 x: 1.0,
                 y: 2.0,
@@ -1506,19 +1640,21 @@ mod tests {
     fn g28_does_not_change_the_carried_motion_mode() {
         // G28/G30 are non-modal: a bare axis-word line afterward should
         // still use G1 (carried from before the G28), not Rapid.
-        let (sink, _, errors) = run("G1 X10\nG28\nX20\n");
+        let (output, errors) = run("G1 X10\nG28\nX20\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 3);
-        assert_eq!(sink.commands[2].motion_mode, MotionMode::Linear);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 3);
+        assert_eq!(motion[2].motion_mode, MotionMode::Linear);
     }
 
     #[test]
     fn g28_1_records_current_position_as_the_reference() {
-        let (sink, _, errors) = run("G0 X7 Y8 Z9\nG28.1\nG28\n");
+        let (output, errors) = run("G0 X7 Y8 Z9\nG28.1\nG28\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 2);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
         assert_eq!(
-            sink.commands[1].target,
+            motion[1].target,
             Position {
                 x: 7.0,
                 y: 8.0,
@@ -1529,7 +1665,7 @@ mod tests {
 
     #[test]
     fn g30_uses_a_separate_reference_position_from_g28() {
-        let (sink, _, errors) = run_configured(
+        let (output, errors) = run_configured(
             |state| {
                 state.g28_position = Position {
                     x: 1.0,
@@ -1545,12 +1681,12 @@ mod tests {
             "G30\n",
         );
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands[0].target.x, 2.0);
+        assert_eq!(output.motion()[0].target.x, 2.0);
     }
 
     #[test]
     fn g53_ignores_work_offset_and_uses_machine_coordinates() {
-        let (sink, _, errors) = run_with_offsets(
+        let (output, errors) = run_with_offsets(
             &[(
                 CoordinateSystem::G54,
                 Position {
@@ -1562,19 +1698,20 @@ mod tests {
             "G1 X10\nG53 G1 X10\n",
         );
         assert!(errors.errors.is_empty());
+        let motion = output.motion();
         // Without G53: X10 programmed + 100 work offset = 110.
-        assert_eq!(sink.commands[0].target.x, 110.0);
+        assert_eq!(motion[0].target.x, 110.0);
         // With G53: X10 is read as the literal machine coordinate.
-        assert_eq!(sink.commands[1].target.x, 10.0);
+        assert_eq!(motion[1].target.x, 10.0);
     }
 
     #[test]
     fn g53_ignores_incremental_distance_mode() {
-        let (sink, _, errors) = run("G91 G1 X10\nG53 G1 X5\n");
+        let (output, errors) = run("G91 G1 X10\nG53 G1 X5\n");
         assert!(errors.errors.is_empty());
         // G53's X5 is an absolute machine coordinate even though G91
         // (incremental) is active.
-        assert_eq!(sink.commands[1].target.x, 5.0);
+        assert_eq!(output.motion()[1].target.x, 5.0);
     }
 
     #[test]
@@ -1582,39 +1719,40 @@ mod tests {
         // Starting Z (0) is below R (2), so G98's default retracts to R
         // (the higher of the two) - see the dedicated G98/G99 tests
         // below for a case where they actually differ.
-        let (sink, _, errors) = run("G81 X5 Y5 Z-10 R2 F100\n");
+        let (output, errors) = run("G81 X5 Y5 Z-10 R2 F100\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 4);
-        assert_eq!(sink.commands[0].motion_mode, MotionMode::Rapid);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 4);
+        assert_eq!(motion[0].motion_mode, MotionMode::Rapid);
         assert_eq!(
-            sink.commands[0].target,
+            motion[0].target,
             Position {
                 x: 5.0,
                 y: 5.0,
                 z: 0.0
             }
         );
-        assert_eq!(sink.commands[1].motion_mode, MotionMode::Rapid);
+        assert_eq!(motion[1].motion_mode, MotionMode::Rapid);
         assert_eq!(
-            sink.commands[1].target,
+            motion[1].target,
             Position {
                 x: 5.0,
                 y: 5.0,
                 z: 2.0
             }
         );
-        assert_eq!(sink.commands[2].motion_mode, MotionMode::Linear);
+        assert_eq!(motion[2].motion_mode, MotionMode::Linear);
         assert_eq!(
-            sink.commands[2].target,
+            motion[2].target,
             Position {
                 x: 5.0,
                 y: 5.0,
                 z: -10.0
             }
         );
-        assert_eq!(sink.commands[3].motion_mode, MotionMode::Rapid);
+        assert_eq!(motion[3].motion_mode, MotionMode::Rapid);
         assert_eq!(
-            sink.commands[3].target,
+            motion[3].target,
             Position {
                 x: 5.0,
                 y: 5.0,
@@ -1625,29 +1763,30 @@ mod tests {
 
     #[test]
     fn g81_g98_retracts_to_initial_z_when_higher_than_r() {
-        let (sink, _, errors) = run("G0 Z5\nG81 X0 Y0 Z-10 R2 F100\n");
+        let (output, errors) = run("G0 Z5\nG81 X0 Y0 Z-10 R2 F100\n");
         assert!(errors.errors.is_empty());
         // Initial Z (5) is higher than R (2), so G98 (the default)
         // retracts all the way back to the initial Z, not just to R.
-        assert_eq!(sink.commands.last().unwrap().target.z, 5.0);
+        assert_eq!(output.motion().last().unwrap().target.z, 5.0);
     }
 
     #[test]
     fn g99_always_retracts_to_r_even_when_lower_than_initial_z() {
-        let (sink, _, errors) = run("G0 Z5\nG99 G81 X0 Y0 Z-10 R2 F100\n");
+        let (output, errors) = run("G0 Z5\nG99 G81 X0 Y0 Z-10 R2 F100\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.last().unwrap().target.z, 2.0);
+        assert_eq!(output.motion().last().unwrap().target.z, 2.0);
     }
 
     #[test]
     fn bare_axis_words_repeat_the_canned_cycle_with_sticky_z_and_r() {
-        let (sink, _, errors) = run("G81 X0 Y0 Z-5 R2 F100\nX10 Y0\n");
+        let (output, errors) = run("G81 X0 Y0 Z-5 R2 F100\nX10 Y0\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 8);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 8);
         // Second hole's cut still goes to Z-5 - Z/R were not repeated
         // on the second line but are sticky.
         assert_eq!(
-            sink.commands[6].target,
+            motion[6].target,
             Position {
                 x: 10.0,
                 y: 0.0,
@@ -1658,19 +1797,19 @@ mod tests {
 
     #[test]
     fn g82_dwells_at_the_bottom_of_the_hole() {
-        let (sink, commands, errors) = run("G82 X0 Y0 Z-5 R2 P0.5 F100\n");
+        let (output, errors) = run("G82 X0 Y0 Z-5 R2 P0.5 F100\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 4);
+        assert_eq!(output.motion().len(), 4);
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![Command::Dwell { seconds: 0.5 }]
         );
     }
 
     #[test]
     fn g82_without_p_and_no_prior_value_is_a_missing_parameter_error() {
-        let (sink, _, errors) = run("G82 X0 Y0 Z-5 R2 F100\n");
-        assert!(sink.commands.is_empty());
+        let (output, errors) = run("G82 X0 Y0 Z-5 R2 F100\n");
+        assert!(output.motion().is_empty());
         assert!(errors
             .errors
             .contains(&InterpretError::CannedCycleMissingParameter));
@@ -1680,24 +1819,25 @@ mod tests {
     fn g83_pecks_in_q_sized_bites_with_full_retracts_between() {
         // R=2, target Z=-10: total depth 12, in bites of 3 - four
         // pecks (3,6,9,12=full depth), three intermediate retracts.
-        let (sink, _, errors) = run("G83 X0 Y0 Z-10 R2 Q3 F100\n");
+        let (output, errors) = run("G83 X0 Y0 Z-10 R2 Q3 F100\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.len(), 10);
-        assert_eq!(sink.commands[2].target.z, -1.0);
-        assert_eq!(sink.commands[3].target.z, 2.0);
-        assert_eq!(sink.commands[4].target.z, -4.0);
-        assert_eq!(sink.commands[5].target.z, 2.0);
-        assert_eq!(sink.commands[6].target.z, -7.0);
-        assert_eq!(sink.commands[7].target.z, 2.0);
+        let motion = output.motion();
+        assert_eq!(motion.len(), 10);
+        assert_eq!(motion[2].target.z, -1.0);
+        assert_eq!(motion[3].target.z, 2.0);
+        assert_eq!(motion[4].target.z, -4.0);
+        assert_eq!(motion[5].target.z, 2.0);
+        assert_eq!(motion[6].target.z, -7.0);
+        assert_eq!(motion[7].target.z, 2.0);
         // Final peck reaches the full programmed depth exactly.
-        assert_eq!(sink.commands[8].target.z, -10.0);
-        assert_eq!(sink.commands[8].motion_mode, MotionMode::Linear);
+        assert_eq!(motion[8].target.z, -10.0);
+        assert_eq!(motion[8].motion_mode, MotionMode::Linear);
     }
 
     #[test]
     fn g83_without_a_positive_q_is_an_error_with_no_partial_output() {
-        let (sink, _, errors) = run("G83 X0 Y0 Z-10 R2 F100\n");
-        assert!(sink.commands.is_empty());
+        let (output, errors) = run("G83 X0 Y0 Z-10 R2 F100\n");
+        assert!(output.motion().is_empty());
         assert!(errors
             .errors
             .contains(&InterpretError::InvalidPeckIncrement));
@@ -1705,43 +1845,46 @@ mod tests {
 
     #[test]
     fn g85_retracts_at_feed_rate_instead_of_rapid() {
-        let (sink, _, errors) = run("G85 X0 Y0 Z-5 R2 F100\n");
+        let (output, errors) = run("G85 X0 Y0 Z-5 R2 F100\n");
         assert!(errors.errors.is_empty());
         assert_eq!(
-            sink.commands.last().unwrap().motion_mode,
+            output.motion().last().unwrap().motion_mode,
             MotionMode::Linear
         );
     }
 
     #[test]
     fn g86_stops_the_spindle_at_the_bottom_and_rapid_retracts() {
-        let (sink, commands, errors) = run("G86 X0 Y0 Z-5 R2 F100\n");
+        let (output, errors) = run("G86 X0 Y0 Z-5 R2 F100\n");
         assert!(errors.errors.is_empty());
-        assert_eq!(sink.commands.last().unwrap().motion_mode, MotionMode::Rapid);
         assert_eq!(
-            commands.commands,
+            output.motion().last().unwrap().motion_mode,
+            MotionMode::Rapid
+        );
+        assert_eq!(
+            output.commands(),
             std::vec![Command::Spindle(SpindleCommand::Stop)]
         );
     }
 
     #[test]
     fn g89_dwells_then_retracts_at_feed_rate() {
-        let (sink, commands, errors) = run("G89 X0 Y0 Z-5 R2 P0.25 F100\n");
+        let (output, errors) = run("G89 X0 Y0 Z-5 R2 P0.25 F100\n");
         assert!(errors.errors.is_empty());
         assert_eq!(
-            sink.commands.last().unwrap().motion_mode,
+            output.motion().last().unwrap().motion_mode,
             MotionMode::Linear
         );
         assert_eq!(
-            commands.commands,
+            output.commands(),
             std::vec![Command::Dwell { seconds: 0.25 }]
         );
     }
 
     #[test]
     fn canned_cycle_without_z_or_r_is_a_missing_parameter_error() {
-        let (sink, _, errors) = run("G81 X0 Y0 F100\n");
-        assert!(sink.commands.is_empty());
+        let (output, errors) = run("G81 X0 Y0 F100\n");
+        assert!(output.motion().is_empty());
         assert!(errors
             .errors
             .contains(&InterpretError::CannedCycleMissingParameter));
@@ -1749,8 +1892,8 @@ mod tests {
 
     #[test]
     fn canned_cycle_in_a_non_xy_plane_is_unsupported() {
-        let (sink, _, errors) = run("G18\nG81 X0 Y0 Z-5 R2 F100\n");
-        assert!(sink.commands.is_empty());
+        let (output, errors) = run("G18\nG81 X0 Y0 Z-5 R2 F100\n");
+        assert!(output.motion().is_empty());
         assert!(errors
             .errors
             .contains(&InterpretError::UnsupportedCannedCyclePlane));
@@ -1758,8 +1901,8 @@ mod tests {
 
     #[test]
     fn g80_cancels_a_canned_cycle() {
-        let (sink, _, errors) = run("G81 X0 Y0 Z-5 R2 F100\nG80\nX10\n");
-        assert!(sink.commands.len() == 4);
+        let (output, errors) = run("G81 X0 Y0 Z-5 R2 F100\nG80\nX10\n");
+        assert_eq!(output.motion().len(), 4);
         assert!(errors.errors.contains(&InterpretError::NoActiveMotionMode));
     }
 }

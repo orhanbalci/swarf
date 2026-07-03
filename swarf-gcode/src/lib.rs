@@ -74,44 +74,38 @@
 //! commands, each command receives zero or more arguments, then
 //! `end_command` -> back to the block, then (after all commands)
 //! `end_line` -> back to the program. `end_line` is where a fully
-//! resolved line becomes output and gets handed to whichever of the
-//! interpreter's three caller-supplied sinks it belongs to:
+//! resolved line becomes output and gets handed to one of the
+//! interpreter's two caller-supplied sinks:
 //!
-//!   - [`MotionSink`] receives [`ResolvedMotionCommand`] (Interface 2) -
-//!     every resolved move (straight, arc, or a canned cycle's
-//!     constituent rapid/feed legs).
-//!   - [`CommandSink`] receives [`Command`] (Interface 3) - everything
-//!     that isn't a move: spindle, coolant, program flow, tool change,
-//!     dwell.
+//!   - [`OutputSink`] receives [`LineOutput`] - either a
+//!     [`ResolvedMotionCommand`] (Interface 2: every resolved move -
+//!     straight, arc, or a canned cycle's constituent rapid/feed legs)
+//!     or a [`Command`] (Interface 3: everything that isn't a move -
+//!     spindle, coolant, program flow, tool change, dwell) - in the
+//!     exact order the interpreter produced them.
 //!   - [`ErrorSink`] receives [`InterpretError`] - both syntax errors
 //!     from `gcode` and semantic errors detected here (modal-group
-//!     conflicts, missing canned-cycle parameters, invalid arcs, etc).
+//!     conflicts, missing canned-cycle parameters, invalid arcs, a
+//!     rejecting `OutputSink`, etc).
 //!
-//! Splitting motion from non-motion output (rather than one combined
-//! stream) means a planner consuming [`MotionSink`] never has to
-//! special-case "this command has no target position" - see
-//! `command.rs`'s module docs for the full rationale. See
-//! `visitor.rs`'s module docs for the full call-flow detail.
+//! Motion and non-motion output share one sink (rather than each having
+//! its own) so a downstream real-time consumer can always tell exactly
+//! where a `Command` (e.g. "spindle on") falls relative to the
+//! surrounding moves - see `command.rs`'s and `visitor.rs`'s module
+//! docs for the full rationale and call-flow detail. For feeding this
+//! interpreter from a real-time loop one line at a time rather than a
+//! whole program at once, see [`Interpreter::step`].
 //!
 //! # Example
 //!
 //! ```
-//! use swarf_gcode::{Command, ErrorSink, Interpreter, InterpretError, MotionSink, ResolvedMotionCommand};
+//! use swarf_gcode::{Command, ErrorSink, Interpreter, InterpretError, LineOutput, OutputSink};
 //!
 //! #[derive(Default)]
-//! struct Moves(Vec<ResolvedMotionCommand>);
-//! impl MotionSink for Moves {
-//!     fn push(&mut self, command: ResolvedMotionCommand) -> Result<(), ()> {
-//!         self.0.push(command);
-//!         Ok(())
-//!     }
-//! }
-//!
-//! #[derive(Default)]
-//! struct Commands(Vec<Command>);
-//! impl swarf_gcode::CommandSink for Commands {
-//!     fn push(&mut self, command: Command) -> Result<(), ()> {
-//!         self.0.push(command);
+//! struct Outputs(Vec<LineOutput>);
+//! impl OutputSink for Outputs {
+//!     fn push(&mut self, output: LineOutput) -> Result<(), ()> {
+//!         self.0.push(output);
 //!         Ok(())
 //!     }
 //! }
@@ -124,12 +118,15 @@
 //!     }
 //! }
 //!
-//! let mut interp = Interpreter::new(Moves::default(), Commands::default(), Errors::default());
+//! let mut interp = Interpreter::new(Outputs::default(), Errors::default());
 //! interp.run("G21 G90\nG0 X10 Y0\nM3 S1000\nG1 X20 F300\n");
-//! let (moves, commands, errors) = interp.into_sinks();
+//! let (outputs, errors) = interp.into_sinks();
 //!
-//! assert_eq!(moves.0.len(), 2); // the G0 and the G1
-//! assert_eq!(commands.0.len(), 1); // the M3
+//! // Order is preserved: the G0, then the M3, then the G1.
+//! assert_eq!(outputs.0.len(), 3);
+//! assert!(matches!(outputs.0[0], LineOutput::Motion(_)));
+//! assert!(matches!(outputs.0[1], LineOutput::Command(Command::Spindle(_))));
+//! assert!(matches!(outputs.0[2], LineOutput::Motion(_)));
 //! assert!(errors.0.is_empty());
 //! ```
 //!
@@ -173,8 +170,8 @@ pub mod motion;
 pub mod state;
 pub mod visitor;
 
-pub use command::{Command, CommandSink, CoolantCommand, ProgramFlow, SpindleCommand};
+pub use command::{Command, CoolantCommand, ProgramFlow, SpindleCommand};
 pub use modal_groups::{ModalGroup, ModalGroupSet};
 pub use motion::{ArcError, ArcGeometry, MotionMode, ResolvedMotionCommand};
 pub use state::{CoordinateSystem, DistanceMode, ModalState, Plane, Position, Units};
-pub use visitor::{ErrorSink, InterpretError, Interpreter, MotionSink};
+pub use visitor::{ErrorSink, InterpretError, Interpreter, LineOutput, OutputSink};
