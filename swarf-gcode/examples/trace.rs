@@ -10,12 +10,17 @@
 //! `examples/gcode_samples/` has a set of real-world test files (see
 //! `examples/gcode_samples/NOTICE.md` for provenance/license - they're
 //! third-party GPL-3.0 test data, not part of this crate's own MIT
-//! source) to try this against, e.g.:
+//! source) to try this against. The file path is relative to wherever
+//! `cargo run` is invoked from:
 //!
 //! ```text
+//! # from the swarf-gcode/ crate directory:
 //! cargo run --example trace -- examples/gcode_samples/arc_rword_test.gcode
 //! cargo run --example trace -- examples/gcode_samples/g17-g18-g19.gcode
 //! cargo run --example trace -- examples/gcode_samples/ugs.gcode | less
+//!
+//! # from the workspace root:
+//! cargo run -p swarf-gcode --example trace -- swarf-gcode/examples/gcode_samples/circle.gcode
 //! ```
 //!
 //! This lives in `examples/` rather than the crate itself because it
