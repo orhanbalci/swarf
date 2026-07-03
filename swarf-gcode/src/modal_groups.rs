@@ -129,8 +129,8 @@ pub fn classify_general_code(major: u32, minor: Option<u32>) -> Option<ModalGrou
     use ModalGroup::*;
     Some(match (major, minor) {
         // --- Non-modal (Group 0) ---
-        (4, None) => NonModal,        // G4 dwell
-        (10, _) => NonModal,          // G10 set coordinate data
+        (4, None) => NonModal, // G4 dwell
+        (10, _) => NonModal,   // G10 set coordinate data
         (28, None) | (28, Some(1)) => NonModal,
         (30, None) | (30, Some(1)) => NonModal,
         (53, None) => NonModal,
@@ -138,12 +138,12 @@ pub fn classify_general_code(major: u32, minor: Option<u32>) -> Option<ModalGrou
         (92, Some(1)) | (92, Some(2)) | (92, Some(3)) => NonModal,
 
         // --- Motion (Group 1) ---
-        (0, None) => Motion,          // rapid
-        (1, None) => Motion,          // linear feed
-        (2, None) => Motion,          // CW arc
-        (3, None) => Motion,          // CCW arc
+        (0, None) => Motion, // rapid
+        (1, None) => Motion, // linear feed
+        (2, None) => Motion, // CW arc
+        (3, None) => Motion, // CCW arc
         (38, Some(2)) | (38, Some(3)) | (38, Some(4)) | (38, Some(5)) => Motion, // probing
-        (80, None) => Motion,         // cancel motion mode
+        (80, None) => Motion, // cancel motion mode
 
         // --- Plane selection (Group 2) ---
         (17, None) => Plane,

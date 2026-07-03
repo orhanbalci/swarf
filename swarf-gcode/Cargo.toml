@@ -6,22 +6,10 @@ license.workspace = true
 description = "A NIST RS274NGC-compatible modal-state G-code interpreter. Resolves parsed G-code into motion commands for a downstream motion planner."
 
 [dependencies]
-# NOTE: gcode 0.7's zero-allocation visitor API (ProgramVisitor/
-# BlockVisitor/CommandVisitor) requires rust_version 1.85 / edition 2024.
-# This container's toolchain is 1.75.0, which cannot build 0.7 at all -
-# confirmed directly (cargo refuses to even parse 0.7's manifest).
-# Pinned to 0.6 here so this scaffold actually compiles and its tests
-# actually run. The interpreter logic below is written against 0.6's
-# REAL API (gcode::parse() -> iterator of GCode, grouped by Line via
-# full_parse_with_callbacks), not the 0.7 visitor hierarchy we designed
-# on paper - see module docs in visitor.rs for the full explanation of
-# what changed and why this is still a faithful implementation of the
-# same interpreter design.
-#
-# ACTION ITEM: once you have a 1.85+ toolchain available (locally or in
-# CI), this should be revisited - bump to gcode = "0.7" and port
-# visitor.rs to the core::{ProgramVisitor, BlockVisitor, CommandVisitor}
-# traits we verified against the docs. The ModalState / modal_groups /
-# motion modules are UNAFFECTED by this - only visitor.rs's plumbing
-# changes.
-gcode = { version = "0.6", default-features = false, features = ["std"] }
+# gcode 0.7's `core` module (ProgramVisitor/BlockVisitor/CommandVisitor)
+# requires rust-version 1.85 / edition 2024 and is available with this
+# toolchain. `default-features = false` drops 0.7's `alloc` and `serde`
+# features - `gcode::core` itself has no alloc dependency, and neither
+# does this crate, so the whole thing builds as genuine no_std with no
+# heap allocation anywhere in the interpreter.
+gcode = { version = "0.7", default-features = false }

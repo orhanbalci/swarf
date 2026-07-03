@@ -14,14 +14,16 @@
 //! Rust crate. This is an attempt to build it, verified against:
 //!   - the NIST RS274NGC Interpreter Version 3 spec (modal groups, Table 4)
 //!   - grblHAL's gc_state / gcode.c as a live reference implementation
-//!   - the `gcode` crate's actual zero-allocation visitor trait API
+//!   - the `gcode` 0.7 crate's zero-allocation visitor trait API
 //!
 //! # Architecture
 //!
 //! We build directly against `gcode::core`'s zero-allocation visitor
-//! traits (`ProgramVisitor` / `BlockVisitor` / `CommandVisitor`), not the
-//! higher-level `gcode::parse()` AST API, because the embedded firmware
-//! target this is ultimately destined for cannot assume a heap allocator.
+//! traits (`ProgramVisitor` / `BlockVisitor` / `CommandVisitor`) rather
+//! than the higher-level, `alloc`-requiring `gcode::parse()` AST API,
+//! because the embedded firmware target this is ultimately destined for
+//! cannot assume a heap allocator - this crate is `no_std` and performs
+//! no allocation anywhere.
 //!
 //! The interpreter's state is split across three visitor levels, each
 //! holding a mutable borrow back into the one real state owner:
@@ -44,15 +46,23 @@
 //! `end_line` -> back to the program. `end_line` is where a fully
 //! resolved line becomes a `ResolvedMotionCommand` and gets handed to
 //! whatever consumes this crate's output (a planner, a buffer, a test).
+//! See `visitor.rs`'s module docs for the full detail.
 //!
 //! # What this crate deliberately does NOT do (yet)
 //!
-//! - Parameter / expression evaluation (`#1`, `#<expr>`). The `gcode`
-//!   crate hands these to us as `Value::Variable(&str)`, unevaluated by
-//!   design (see its docs). We reject them with a clear diagnostic for
-//!   now rather than silently defaulting them to zero or similar - that
-//!   would be a correctness footgun for anyone using this crate without
+//! - Parameter / expression evaluation (`#1`, `#<expr>`). `gcode` 0.7's
+//!   `Value` enum has a `Variable(&str)` case for this in principle, but
+//!   this release's actual lexer never constructs it - verified
+//!   directly - so `#` currently surfaces as a plain syntax error
+//!   (`InterpretError::SyntaxError`) rather than something we can
+//!   distinguish and reject on purpose. `record_axis` still checks for
+//!   `Value::Variable` and would map it to `InterpretError::UnsupportedSyntax`
+//!   if a future `gcode` release starts producing it. Either way, we
+//!   never silently default a parameter reference to zero - that would
+//!   be a correctness footgun for anyone using this crate without
 //!   reading this note. Parameter support is real, deferrable scope.
+//! - Block delete (`/`). Not a feature of `gcode` 0.7's grammar either -
+//!   a leading `/` is reported as a syntax diagnostic, not stripped.
 //! - Canned cycles (G73, G81-G89), tool length offset resolution, cutter
 //!   compensation, threading, splines. These are real parts of the NIST
 //!   spec but represent a large amount of additional surface area we are
@@ -60,20 +70,8 @@
 //!   "core motion semantics first."
 //! - Modal-group conflict detection is started here but intentionally
 //!   minimal; see `modal_groups` module docs for current coverage.
-//!
-//! # Toolchain / dependency note (read before extending this crate)
-//!
-//! This crate is currently pinned to `gcode = "0.6"`, NOT the `gcode`
-//! 0.7 zero-allocation visitor API we originally designed against. 0.7
-//! requires a 1.85+ / edition-2024 toolchain; this was verified directly
-//! against the environment this was scaffolded in (rustc 1.75.0, which
-//! fails even to parse 0.7's Cargo.toml). See `visitor.rs`'s module docs
-//! for the full explanation of what changed in the implementation as a
-//! result, and Cargo.toml for the action item to revisit this once a
-//! newer toolchain is available. Consequently this crate currently
-//! depends on `std` (via gcode's `std` feature) rather than being
-//! `no_std` - that is also an action item for the 0.7 port, not a
-//! permanent design decision.
+
+#![cfg_attr(not(test), no_std)]
 
 pub mod modal_groups;
 pub mod motion;
