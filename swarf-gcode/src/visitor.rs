@@ -604,6 +604,16 @@ impl<O: OutputSink, E: ErrorSink> BlockCtx<'_, O, E> {
     /// rejecting (with `UnsupportedSyntax`) anything that isn't a
     /// literal number - parameters/expressions are out of scope, see
     /// `InterpretError`.
+    ///
+    /// `letter` is upper-cased before matching: `gcode` 0.7's lexer
+    /// preserves a word letter's original source case (verified
+    /// directly - `scan_letter` copies the raw source slice, no
+    /// normalization) rather than normalizing it the way it does for
+    /// the G/M/T mnemonic letters, so a lowercase axis word like `x5`
+    /// would otherwise silently fall through the `_ => {}` arm below
+    /// and be dropped - a real violation of NIST's "input is case
+    /// insensitive" rule, not a hypothetical one (caught by running a
+    /// real-world file using lowercase `z` for a helical Z move).
     fn record_axis(&mut self, letter: char, value: Value<'_>) {
         let v = match value {
             Value::Literal(v) => v,
@@ -612,7 +622,7 @@ impl<O: OutputSink, E: ErrorSink> BlockCtx<'_, O, E> {
                 return;
             }
         };
-        match letter {
+        match letter.to_ascii_uppercase() {
             'X' => self.x = Some(v),
             'Y' => self.y = Some(v),
             'Z' => self.z = Some(v),
@@ -786,6 +796,17 @@ impl<O: OutputSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, O, E> {
     }
 
     fn end_line(self, _span: Span) {
+        // F is modal and takes effect the instant it's given, whether
+        // or not this same line also commands a move (e.g. a bare
+        // "F500" line on its own, seen in real-world files) - applied
+        // unconditionally and up front, mirroring how S is handled
+        // below, and BEFORE motion resolution so a line that gives F
+        // and a move together (e.g. "G1 X10 F500") uses the new rate
+        // for its own move rather than only from the next line on.
+        if let Some(f) = self.f {
+            self.interp.state.feed_rate = self.interp.state.to_mm(f as f64);
+        }
+
         let effective_mode = self.resolved_mode.unwrap_or(self.interp.state.motion_mode);
         let is_arc = matches!(
             effective_mode,
@@ -885,10 +906,6 @@ impl<O: OutputSink, E: ErrorSink> BlockVisitor for BlockCtx<'_, O, E> {
             }
 
             if !arc_failed {
-                if let Some(f) = self.f {
-                    self.interp.state.feed_rate = self.interp.state.to_mm(f as f64);
-                }
-
                 let command = ResolvedMotionCommand {
                     start,
                     target,
@@ -1236,6 +1253,55 @@ mod tests {
             .errors
             .iter()
             .all(|e| matches!(e, InterpretError::SyntaxError(_))));
+    }
+
+    #[test]
+    fn lowercase_axis_words_are_treated_the_same_as_uppercase() {
+        // Regression test: found by running a real-world file
+        // (Universal-G-Code-Sender's spiral.gcode) that writes "z 20"
+        // in lowercase. `gcode` 0.7's lexer preserves a word letter's
+        // original source case (verified directly) rather than
+        // normalizing it - unlike its G/M/T mnemonic recognition, which
+        // IS case-insensitive - so `record_axis` must upper-case
+        // itself. Before that fix, lowercase axis words were silently
+        // dropped rather than rejected, which is worse: no error, just
+        // wrong output.
+        let (output, errors) = run("g1 x5 y10\nG1 X5 z20\n");
+        assert!(errors.errors.is_empty());
+        let motion = output.motion();
+        assert_eq!(motion.len(), 2);
+        assert_eq!(
+            motion[0].target,
+            Position {
+                x: 5.0,
+                y: 10.0,
+                z: 0.0
+            }
+        );
+        assert_eq!(motion[1].target.z, 20.0);
+    }
+
+    #[test]
+    fn bare_f_word_line_updates_feed_rate_for_later_moves() {
+        // Regression test: found by running a real-world file
+        // (Universal-G-Code-Sender's no_spaces.gcode), which sets F on
+        // its own line with no G-word or axis words before any motion.
+        // F is modal like S - it must take effect immediately, not only
+        // when a move happens to share its line, or every subsequent
+        // move keeps whatever feed_rate defaulted to (0.0) forever.
+        let (output, errors) = run("F500\nG1 X10\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(output.motion()[0].feed_rate, 500.0);
+    }
+
+    #[test]
+    fn f_word_on_the_same_line_as_a_move_applies_to_that_move() {
+        // Not just carried forward from a previous line - F given
+        // alongside a move must apply to THAT move too, not only from
+        // the next line onward.
+        let (output, errors) = run("G1 X10 F900\n");
+        assert!(errors.errors.is_empty());
+        assert_eq!(output.motion()[0].feed_rate, 900.0);
     }
 
     #[test]
