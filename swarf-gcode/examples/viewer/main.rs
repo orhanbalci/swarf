@@ -44,8 +44,9 @@ use std::{env, fs};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use swarf_gcode::{
-    Command, CoolantCommand, ErrorSink, InterpretError, Interpreter, LineOutput, MotionMode,
-    OutputSink, ProgramFlow, ResolvedMotionCommand, SpindleCommand,
+    Command, CoolantCommand, DistanceMode, ErrorSink, InterpretError, Interpreter, LineOutput,
+    ModalState, MotionMode, OutputSink, Plane, ProgramFlow, ResolvedMotionCommand, SpindleCommand,
+    Units,
 };
 
 use geometry::{Scene, TraceEntry};
@@ -82,9 +83,48 @@ impl ErrorSink for RecordingErrors {
     }
 }
 
+/// Whether the spindle is on, and if so which direction and RPM - the
+/// RPM the *command* actually carried, not just whichever S word is
+/// modally in effect (S is sticky and can change while the spindle sits
+/// idle; the status panel should show what's really turning).
+#[derive(Clone, Copy, PartialEq)]
+enum SpindleStatus {
+    Off,
+    Clockwise(f64),
+    CounterClockwise(f64),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum CoolantStatus {
+    Off,
+    Mist,
+    Flood,
+}
+
+/// A snapshot of "what the controller would report right now" as of
+/// one resolved output - `ModalState` alone doesn't carry on/off flags
+/// for spindle/coolant (deliberately, see its module docs: those are
+/// one-shot `Command`s, not persistent modal state), so this folds the
+/// `Command` stream on top of a per-line `ModalState` snapshot to
+/// reconstruct them.
+#[derive(Clone, Copy)]
+struct ControllerStatus {
+    state: ModalState,
+    spindle: SpindleStatus,
+    coolant: CoolantStatus,
+    loaded_tool: Option<u32>,
+}
+
 /// Interpret `source` one line at a time via `Interpreter::step`,
-/// recording which source line produced each resolved output.
-fn precompute(source: &str) -> (Vec<TraceEntry>, Vec<(usize, InterpretError)>) {
+/// recording which source line produced each resolved output, a
+/// per-entry `ControllerStatus` snapshot, and any errors.
+fn precompute(
+    source: &str,
+) -> (
+    Vec<TraceEntry>,
+    Vec<ControllerStatus>,
+    Vec<(usize, InterpretError)>,
+) {
     let current_line = Rc::new(Cell::new(0));
     let sink = RecordingSink {
         current_line: Rc::clone(&current_line),
@@ -96,16 +136,51 @@ fn precompute(source: &str) -> (Vec<TraceEntry>, Vec<(usize, InterpretError)>) {
     };
 
     let mut interp = Interpreter::new(sink, errors);
+    let mut line_states = Vec::new();
     for (line_index, line) in source.lines().enumerate() {
         current_line.set(line_index);
         // `step` doesn't require a trailing newline, but `gcode`'s
         // parser treats it as a line terminator - appending one keeps
         // every call's input shaped exactly like a real serial line.
         interp.run(&format!("{line}\n"));
+        line_states.push(interp.state);
     }
 
     let (sink, errors) = interp.into_sinks();
-    (sink.entries, errors.errors)
+    let entries = sink.entries;
+
+    let mut spindle = SpindleStatus::Off;
+    let mut coolant = CoolantStatus::Off;
+    let mut loaded_tool = None;
+    let statuses = entries
+        .iter()
+        .map(|entry| {
+            if let LineOutput::Command(cmd) = &entry.output {
+                match cmd {
+                    Command::Spindle(SpindleCommand::Clockwise(rpm)) => {
+                        spindle = SpindleStatus::Clockwise(*rpm);
+                    }
+                    Command::Spindle(SpindleCommand::CounterClockwise(rpm)) => {
+                        spindle = SpindleStatus::CounterClockwise(*rpm);
+                    }
+                    Command::Spindle(SpindleCommand::Stop) => spindle = SpindleStatus::Off,
+                    Command::Coolant(CoolantCommand::Mist) => coolant = CoolantStatus::Mist,
+                    Command::Coolant(CoolantCommand::Flood) => coolant = CoolantStatus::Flood,
+                    Command::Coolant(CoolantCommand::Off) => coolant = CoolantStatus::Off,
+                    Command::ToolChange { tool } => loaded_tool = Some(*tool),
+                    Command::ProgramFlow(_) | Command::Dwell { .. } => {}
+                }
+            }
+            ControllerStatus {
+                state: line_states[entry.line],
+                spindle,
+                coolant,
+                loaded_tool,
+            }
+        })
+        .collect();
+
+    (entries, statuses, errors.errors)
 }
 
 /// Tokenize `line` into `(letter, major, start, end)` words - the
@@ -277,6 +352,170 @@ fn describe_command(c: Command) -> String {
     }
 }
 
+/// Simple on/off text badge: a colored dot plus a label, green-ish when
+/// active and gray when idle. Kept deliberately plain (no gauges/lamps)
+/// per feedback that a more elaborate "instrument cluster" look didn't
+/// fit here and broke the layout.
+fn status_badge(ui: &mut egui::Ui, on: bool, active_color: egui::Color32, text: &str) {
+    ui.horizontal(|ui| {
+        ui.colored_label(
+            if on {
+                active_color
+            } else {
+                egui::Color32::from_gray(120)
+            },
+            "\u{25cf}", // ●
+        );
+        ui.label(text);
+    });
+}
+
+/// How to render a status row's value column - most rows are plain
+/// text, but spindle/coolant get the on/off dot badge.
+enum StatusValue {
+    Badge {
+        on: bool,
+        color: egui::Color32,
+        text: String,
+    },
+    Text(String),
+    Monospace(String),
+}
+
+/// Status panel using the same `TableBuilder` component as the source
+/// listing (striped rows, two columns) rather than a custom grid/canvas
+/// widget - keeps this panel's layout behavior consistent with the rest
+/// of the sidebar.
+fn draw_status_panel(ui: &mut egui::Ui, status: &ControllerStatus) {
+    let rows: Vec<(&str, StatusValue)> = vec![
+        (
+            "Spindle",
+            match status.spindle {
+                SpindleStatus::Off => StatusValue::Badge {
+                    on: false,
+                    color: egui::Color32::GREEN,
+                    text: "off".to_string(),
+                },
+                SpindleStatus::Clockwise(rpm) => StatusValue::Badge {
+                    on: true,
+                    color: egui::Color32::from_rgb(90, 200, 110),
+                    text: format!("CW, {rpm:.0} RPM"),
+                },
+                SpindleStatus::CounterClockwise(rpm) => StatusValue::Badge {
+                    on: true,
+                    color: egui::Color32::from_rgb(90, 200, 110),
+                    text: format!("CCW, {rpm:.0} RPM"),
+                },
+            },
+        ),
+        (
+            "Coolant",
+            match status.coolant {
+                CoolantStatus::Off => StatusValue::Badge {
+                    on: false,
+                    color: egui::Color32::from_rgb(90, 170, 230),
+                    text: "off".to_string(),
+                },
+                CoolantStatus::Mist => StatusValue::Badge {
+                    on: true,
+                    color: egui::Color32::from_rgb(90, 170, 230),
+                    text: "mist".to_string(),
+                },
+                CoolantStatus::Flood => StatusValue::Badge {
+                    on: true,
+                    color: egui::Color32::from_rgb(90, 170, 230),
+                    text: "flood".to_string(),
+                },
+            },
+        ),
+        (
+            "Position",
+            StatusValue::Monospace(format!(
+                "X{:.3}  Y{:.3}  Z{:.3}",
+                status.state.position.x, status.state.position.y, status.state.position.z
+            )),
+        ),
+        (
+            "Feed rate",
+            StatusValue::Text(format!("{:.1} mm/min", status.state.feed_rate)),
+        ),
+        (
+            "Spindle S-word",
+            StatusValue::Text(format!("{:.0} RPM", status.state.spindle_speed)),
+        ),
+        (
+            "Units",
+            StatusValue::Text(
+                match status.state.units {
+                    Units::Millimeters => "mm (G21)",
+                    Units::Inches => "in (G20)",
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "Plane",
+            StatusValue::Text(
+                match status.state.plane {
+                    Plane::Xy => "XY (G17)",
+                    Plane::Zx => "ZX (G18)",
+                    Plane::Yz => "YZ (G19)",
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "Distance mode",
+            StatusValue::Text(
+                match status.state.distance_mode {
+                    DistanceMode::Absolute => "Absolute (G90)",
+                    DistanceMode::Incremental => "Incremental (G91)",
+                }
+                .to_string(),
+            ),
+        ),
+        (
+            "Work offset",
+            StatusValue::Text(format!("{:?}", status.state.coordinate_system)),
+        ),
+        (
+            "Tool",
+            StatusValue::Text(match (status.loaded_tool, status.state.selected_tool) {
+                (Some(loaded), Some(sel)) if loaded == sel => format!("T{loaded}"),
+                (Some(loaded), Some(sel)) => format!("T{loaded} (T{sel} selected next)"),
+                (Some(loaded), None) => format!("T{loaded}"),
+                (None, Some(sel)) => format!("none loaded (T{sel} selected)"),
+                (None, None) => "none".to_string(),
+            }),
+        ),
+    ];
+
+    let row_height = ui.text_style_height(&egui::TextStyle::Body);
+    TableBuilder::new(ui)
+        .id_salt("status_table")
+        .striped(true)
+        .column(Column::exact(110.0))
+        .column(Column::remainder())
+        .min_scrolled_height(0.0)
+        .body(|body| {
+            body.rows(row_height, rows.len(), |mut row| {
+                let (label, value) = &rows[row.index()];
+                row.col(|ui| {
+                    ui.label(*label);
+                });
+                row.col(|ui| match value {
+                    StatusValue::Badge { on, color, text } => status_badge(ui, *on, *color, text),
+                    StatusValue::Text(text) => {
+                        ui.label(text);
+                    }
+                    StatusValue::Monospace(text) => {
+                        ui.monospace(text);
+                    }
+                });
+            });
+        });
+}
+
 /// Build one source-line row's text, optionally highlighting a
 /// sub-range (the currently-executing command word - see
 /// `highlight_span_for`) and dimming non-current lines so the current
@@ -339,6 +578,7 @@ M2
 struct ViewerApp {
     source_lines: Vec<String>,
     entries: Vec<TraceEntry>,
+    statuses: Vec<ControllerStatus>,
     errors: Vec<(usize, InterpretError)>,
     scene: Scene,
     axis_vertex_count: u32,
@@ -353,7 +593,7 @@ struct ViewerApp {
 
 impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, source: String) -> Self {
-        let (entries, errors) = precompute(&source);
+        let (entries, statuses, errors) = precompute(&source);
         let scene = Scene::build(&entries);
 
         let render_state = cc
@@ -379,6 +619,7 @@ impl ViewerApp {
         Self {
             source_lines: source.lines().map(str::to_string).collect(),
             entries,
+            statuses,
             errors,
             scene,
             axis_vertex_count,
@@ -431,9 +672,25 @@ impl eframe::App for ViewerApp {
             .get(self.current_step)
             .and_then(|entry| highlight_span_for(&self.source_lines[entry.line], &entry.output));
 
+        let status = self
+            .statuses
+            .get(self.current_step)
+            .copied()
+            .unwrap_or(ControllerStatus {
+                state: ModalState::default(),
+                spindle: SpindleStatus::Off,
+                coolant: CoolantStatus::Off,
+                loaded_tool: None,
+            });
+
         egui::SidePanel::left("source")
             .min_width(420.0)
             .show(ctx, |ui| {
+                ui.heading("Controller Status");
+                draw_status_panel(ui, &status);
+                ui.add_space(4.0);
+                ui.separator();
+
                 ui.heading("Source");
 
                 let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
@@ -443,6 +700,7 @@ impl eframe::App for ViewerApp {
                 // would fight any manual scrolling the user does to look
                 // around the rest of the file.
                 let mut table = TableBuilder::new(ui)
+                    .id_salt("source_table")
                     .striped(true)
                     .column(Column::exact(36.0))
                     .column(Column::remainder())
