@@ -21,7 +21,7 @@
 
 use std::ops::Range;
 
-use swarf_gcode::{LineOutput, MotionMode, Position, ResolvedMotionCommand};
+use swarf_gcode::{ArcGeometry, LineOutput, MotionMode, Position, ResolvedMotionCommand};
 
 /// Plain solid-geometry vertex: position + color, rendered with a
 /// direct MVP transform and no thickening - see this module's docs.
@@ -140,6 +140,90 @@ fn push_segment(vertices: &mut Vec<LineVertex>, a: Position, b: Position, color:
     vertices.push(b_neg);
 }
 
+/// The angle/center/sweep parameters of one resolved arc move, shared
+/// by tessellation (`push_motion`) and by sampling a point at some
+/// fraction of the arc's travel (`motion_point_at`/`motion_length` -
+/// used by the viewer's play/pause animation to move the tool marker
+/// smoothly along a curve, not just jump between its tessellated
+/// segments).
+struct ArcParams {
+    plane: Plane,
+    center_uv: (f64, f64),
+    radius: f64,
+    angle0: f64,
+    sweep: f64,
+    linear0: f64,
+    linear1: f64,
+}
+
+impl ArcParams {
+    fn from_motion(m: &ResolvedMotionCommand, arc: &ArcGeometry) -> Self {
+        let plane = detect_plane(m.start, arc.center);
+        let (cu, cv) = in_plane(arc.center, plane);
+        let (u0, v0) = in_plane(m.start, plane);
+        let (u1, v1) = in_plane(m.target, plane);
+        let (du0, dv0) = (u0 - cu, v0 - cv);
+        let (du1, dv1) = (u1 - cu, v1 - cv);
+        let radius = (du0 * du0 + dv0 * dv0).sqrt();
+
+        let angle0 = dv0.atan2(du0);
+        let angle1 = dv1.atan2(du1);
+
+        let clockwise = m.motion_mode == MotionMode::ArcClockwise;
+        let full_circle = (m.start.x - m.target.x).abs() < 1e-9
+            && (m.start.y - m.target.y).abs() < 1e-9
+            && (m.start.z - m.target.z).abs() < 1e-9;
+
+        const TAU: f64 = std::f64::consts::TAU;
+        let sweep = if full_circle {
+            if clockwise {
+                -TAU
+            } else {
+                TAU
+            }
+        } else if clockwise {
+            // Clockwise = decreasing angle; wrap to a negative sweep.
+            let mut d = angle0 - angle1;
+            if d <= 0.0 {
+                d += TAU;
+            }
+            -d
+        } else {
+            let mut d = angle1 - angle0;
+            if d <= 0.0 {
+                d += TAU;
+            }
+            d
+        };
+
+        Self {
+            plane,
+            center_uv: (cu, cv),
+            radius,
+            angle0,
+            sweep,
+            linear0: linear_coord(m.start, plane),
+            linear1: linear_coord(m.target, plane),
+        }
+    }
+
+    /// A point at fraction `t` (0.0 = start, 1.0 = target) along the arc.
+    fn point_at(&self, t: f64) -> Position {
+        let angle = self.angle0 + self.sweep * t;
+        let (cu, cv) = self.center_uv;
+        let (u, v) = (cu + self.radius * angle.cos(), cv + self.radius * angle.sin());
+        let linear = self.linear0 + (self.linear1 - self.linear0) * t;
+        from_plane(u, v, linear, self.plane)
+    }
+
+    /// Arc length in mm (helical pitch is negligible for the linear
+    /// axis's tiny contribution here - same simplification a real
+    /// controller's arc feed-rate accounting makes).
+    fn length(&self) -> f64 {
+        self.radius * self.sweep.abs()
+    }
+}
+
 /// Tessellate one resolved move into thick-line quads. The vertex count
 /// per segment (6, vs. 2 for a plain line list) is irrelevant for a
 /// toolpath's scale - even a large real-world file stays well within
@@ -156,59 +240,52 @@ fn push_motion(vertices: &mut Vec<LineVertex>, m: &ResolvedMotionCommand) {
         return;
     };
 
-    let plane = detect_plane(m.start, arc.center);
-    let (cu, cv) = in_plane(arc.center, plane);
-    let (u0, v0) = in_plane(m.start, plane);
-    let (u1, v1) = in_plane(m.target, plane);
-    let (du0, dv0) = (u0 - cu, v0 - cv);
-    let (du1, dv1) = (u1 - cu, v1 - cv);
-    let radius = (du0 * du0 + dv0 * dv0).sqrt();
-
-    let angle0 = dv0.atan2(du0);
-    let angle1 = dv1.atan2(du1);
-
-    let clockwise = m.motion_mode == MotionMode::ArcClockwise;
-    let full_circle = (m.start.x - m.target.x).abs() < 1e-9
-        && (m.start.y - m.target.y).abs() < 1e-9
-        && (m.start.z - m.target.z).abs() < 1e-9;
-
+    let params = ArcParams::from_motion(m, &arc);
     const TAU: f64 = std::f64::consts::TAU;
-    let sweep = if full_circle {
-        if clockwise {
-            -TAU
-        } else {
-            TAU
-        }
-    } else if clockwise {
-        // Clockwise = decreasing angle; wrap to a negative sweep.
-        let mut d = angle0 - angle1;
-        if d <= 0.0 {
-            d += TAU;
-        }
-        -d
-    } else {
-        let mut d = angle1 - angle0;
-        if d <= 0.0 {
-            d += TAU;
-        }
-        d
-    };
-
-    let segments = ((sweep.abs() / TAU) * MAX_ARC_SEGMENTS as f64)
+    let segments = ((params.sweep.abs() / TAU) * MAX_ARC_SEGMENTS as f64)
         .ceil()
         .max(2.0) as usize;
-    let linear0 = linear_coord(m.start, plane);
-    let linear1 = linear_coord(m.target, plane);
 
     let mut prev = m.start;
     for i in 1..=segments {
         let t = i as f64 / segments as f64;
-        let angle = angle0 + sweep * t;
-        let (u, v) = (cu + radius * angle.cos(), cv + radius * angle.sin());
-        let linear = linear0 + (linear1 - linear0) * t;
-        let point = from_plane(u, v, linear, plane);
+        let point = params.point_at(t);
         push_segment(vertices, prev, point, color);
         prev = point;
+    }
+}
+
+/// The tool tip's position at fraction `t` (0.0 = `m.start`, 1.0 =
+/// `m.target`) of the way through resolved move `m` - a straight-line
+/// lerp for `Rapid`/`Linear`, or the corresponding point along the arc
+/// for `ArcClockwise`/`ArcCounterclockwise`. Used by the viewer to
+/// animate the tool marker smoothly along a move rather than only
+/// showing it at each move's endpoints.
+pub fn motion_point_at(m: &ResolvedMotionCommand, t: f64) -> Position {
+    let t = t.clamp(0.0, 1.0);
+    match m.arc {
+        None => Position {
+            x: m.start.x + (m.target.x - m.start.x) * t,
+            y: m.start.y + (m.target.y - m.start.y) * t,
+            z: m.start.z + (m.target.z - m.start.z) * t,
+        },
+        Some(arc) => ArcParams::from_motion(m, &arc).point_at(t),
+    }
+}
+
+/// The path length of resolved move `m`, in mm - straight-line distance
+/// for `Rapid`/`Linear`, arc length for `ArcClockwise`/
+/// `ArcCounterclockwise`. Used by the viewer to time how long a move's
+/// animation should take at a given feed rate.
+pub fn motion_length(m: &ResolvedMotionCommand) -> f64 {
+    match m.arc {
+        None => {
+            let dx = m.target.x - m.start.x;
+            let dy = m.target.y - m.start.y;
+            let dz = m.target.z - m.start.z;
+            (dx * dx + dy * dy + dz * dz).sqrt()
+        }
+        Some(arc) => ArcParams::from_motion(m, &arc).length(),
     }
 }
 

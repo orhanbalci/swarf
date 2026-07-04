@@ -39,6 +39,7 @@ mod renderer;
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Instant;
 use std::{env, fs};
 
 use eframe::egui;
@@ -583,6 +584,23 @@ struct ViewerApp {
     scene: Scene,
     axis_vertex_count: u32,
     current_step: usize,
+    /// How far through `current_step`'s motion the tool marker has
+    /// travelled: 0.0 = `start`, 1.0 = `target`. Manual navigation
+    /// (step/reset/end/arrow keys) always leaves this at 1.0 - "settled
+    /// at this step's end", matching the viewer's original all-or-
+    /// nothing behavior. Only playback (`advance_playback`) produces
+    /// values in between, to move the marker smoothly along a move
+    /// instead of only at its endpoints. Meaningless (ignored) for
+    /// steps whose output isn't a `Motion`.
+    progress: f32,
+    playing: bool,
+    /// Simulation speed as a fraction of real time: 1.0 plays at the
+    /// program's actual feed rates, 0.5 half that, 2.0 twice, etc.
+    speed: f32,
+    /// Wall-clock time of the last `update` call, used to turn frame
+    /// time into simulated seconds for `advance_playback`. `None` on
+    /// the very first frame, so that frame contributes no elapsed time.
+    last_tick: Option<Instant>,
     camera: OrbitCamera,
     /// Which line the table was last force-scrolled to - so
     /// `scroll_to_row` only fires when the highlighted line actually
@@ -590,6 +608,19 @@ struct ViewerApp {
     /// single frame.
     last_scrolled_line: Option<usize>,
 }
+
+/// Assumed rapid traverse rate, in mm/min, purely for pacing the
+/// play/pause animation - `ResolvedMotionCommand::feed_rate` is
+/// meaningless for `Rapid` moves (see its doc comment), so there's no
+/// programmed rate to time a rapid's on-screen travel against. Chosen
+/// to look "fast" relative to typical feed rates, not to model any real
+/// machine's actual rapid speed.
+const ASSUMED_RAPID_RATE_MM_PER_MIN: f64 = 6000.0;
+
+/// Floor under a feed move's effective rate for timing purposes, so a
+/// line with no `F` word yet (feed rate 0.0, `ModalState`'s default)
+/// doesn't produce an infinite/stalled animation duration.
+const MIN_FEED_RATE_MM_PER_MIN: f64 = 10.0;
 
 impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, source: String) -> Self {
@@ -626,19 +657,105 @@ impl ViewerApp {
             scene,
             axis_vertex_count,
             current_step: 0,
+            progress: 1.0,
+            playing: false,
+            speed: 1.0,
+            last_tick: None,
             camera: OrbitCamera::default_isometric(),
             last_scrolled_line: None,
         }
     }
 
+    /// How long (in simulated seconds) `step`'s motion should take to
+    /// animate, at its own programmed feed rate (or the assumed rapid
+    /// rate for `Rapid` moves) - `0.0` for anything else (a
+    /// non-`Motion` output, or a zero-length move), meaning
+    /// `advance_playback` treats it as instantaneous and moves straight
+    /// on to the next step without consuming any playback time.
+    fn step_duration_secs(&self, step: usize) -> f32 {
+        match self.entries.get(step).map(|e| &e.output) {
+            Some(LineOutput::Motion(m)) => {
+                let length = geometry::motion_length(m);
+                if length <= 1e-9 {
+                    return 0.0;
+                }
+                let rate = if m.motion_mode == MotionMode::Rapid {
+                    ASSUMED_RAPID_RATE_MM_PER_MIN
+                } else {
+                    m.feed_rate.max(MIN_FEED_RATE_MM_PER_MIN)
+                };
+                ((length / rate) * 60.0) as f32
+            }
+            Some(LineOutput::Command(Command::Dwell { seconds })) => *seconds as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// Manual navigation always leaves the marker "settled" at the
+    /// resulting step's end - matching the viewer's original
+    /// all-or-nothing behavior - and stops any in-progress playback, so
+    /// the user's manual jump isn't immediately overridden by the next
+    /// animated frame.
+    fn goto_step(&mut self, step: usize) {
+        self.playing = false;
+        self.current_step = step.min(self.entries.len().saturating_sub(1));
+        self.progress = 1.0;
+    }
+
     fn step_forward(&mut self) {
         if self.current_step + 1 < self.entries.len() {
-            self.current_step += 1;
+            self.goto_step(self.current_step + 1);
+        } else {
+            self.playing = false;
         }
     }
 
     fn step_backward(&mut self) {
-        self.current_step = self.current_step.saturating_sub(1);
+        self.goto_step(self.current_step.saturating_sub(1));
+    }
+
+    /// Advance playback by `seconds` of simulated time (already scaled
+    /// by `speed`), moving `progress` within `current_step` and rolling
+    /// over into subsequent steps as needed. Steps with zero duration
+    /// (non-`Motion` output, dwells aside, or a zero-length move) are
+    /// crossed instantly, without consuming any of `seconds` - matching
+    /// how a real controller doesn't pause between a spindle command
+    /// and the move that follows it.
+    fn advance_playback(&mut self, mut seconds: f32) {
+        // Bounded rather than a bare `while` so a pathological run of
+        // zero-duration steps (shouldn't happen - `step_duration_secs`
+        // always returns >0 for a real move - but this is animation
+        // code, not safety-critical) can't hang a frame.
+        let max_iterations = self.entries.len() + 4;
+        for _ in 0..max_iterations {
+            if seconds <= 0.0 {
+                return;
+            }
+            let duration = self.step_duration_secs(self.current_step);
+            if duration <= f32::EPSILON {
+                if self.current_step + 1 >= self.entries.len() {
+                    self.playing = false;
+                    self.progress = 1.0;
+                    return;
+                }
+                self.current_step += 1;
+                self.progress = 0.0;
+                continue;
+            }
+            let time_left_in_step = (1.0 - self.progress) * duration;
+            if seconds < time_left_in_step {
+                self.progress += seconds / duration;
+                return;
+            }
+            seconds -= time_left_in_step;
+            if self.current_step + 1 >= self.entries.len() {
+                self.playing = false;
+                self.progress = 1.0;
+                return;
+            }
+            self.current_step += 1;
+            self.progress = 0.0;
+        }
     }
 }
 
@@ -651,7 +768,24 @@ impl eframe::App for ViewerApp {
             if i.key_pressed(egui::Key::ArrowLeft) {
                 self.step_backward();
             }
+            if i.key_pressed(egui::Key::Space) {
+                self.playing = !self.playing;
+            }
         });
+
+        // Turn wall-clock frame time into simulated seconds and advance
+        // playback. `last_tick` is updated every frame regardless of
+        // play state, so toggling play back on after sitting paused
+        // doesn't replay a huge backlog of "elapsed" time in one jump.
+        let now = Instant::now();
+        let dt = self.last_tick.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
+        self.last_tick = Some(now);
+        if self.playing {
+            self.advance_playback(dt * self.speed);
+            // Immediate mode only redraws on input by default - without
+            // this, the animation would freeze between user input events.
+            ctx.request_repaint();
+        }
 
         if !self.errors.is_empty() {
             egui::TopBottomPanel::top("errors").show(ctx, |ui| {
@@ -749,6 +883,29 @@ impl eframe::App for ViewerApp {
                 }
             });
 
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(if self.playing { "\u{25b6} Playing" } else { "\u{23f8} Paused" });
+                ui.separator();
+                ui.label(format!(
+                    "Step {} / {}",
+                    self.current_step.saturating_add(1).min(self.entries.len()),
+                    self.entries.len()
+                ));
+                if let Some(entry) = self.entries.get(self.current_step) {
+                    ui.separator();
+                    ui.monospace(describe_output(&entry.output));
+                }
+                if !self.errors.is_empty() {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 80, 80),
+                        format!("{} error(s)", self.errors.len()),
+                    );
+                }
+            });
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::Frame::canvas(ui.style()).show(ui, |ui| {
                 let (rect, response) =
@@ -820,10 +977,21 @@ impl eframe::App for ViewerApp {
                 // Only show the tool-head marker once at least one step
                 // has resolved - before that there's no meaningful "tool
                 // tip position" yet, just the machine's power-on default.
+                // For a `Motion` step, `progress` (1.0 unless playback is
+                // mid-move) picks a point along it rather than only ever
+                // showing the endpoint - `status.state.position` already
+                // IS that endpoint (`ModalState` only moves on a
+                // resolved `Motion`), so non-`Motion` steps (spindle/
+                // coolant/etc., where `progress` is meaningless) fall
+                // back to it unchanged.
+                let animated_position = match self.entries.get(self.current_step).map(|e| &e.output) {
+                    Some(LineOutput::Motion(m)) => geometry::motion_point_at(m, self.progress as f64),
+                    _ => status.state.position,
+                };
                 let tool_position = (self.current_step < self.entries.len()).then_some([
-                    status.state.position.x as f32,
-                    status.state.position.y as f32,
-                    status.state.position.z as f32,
+                    animated_position.x as f32,
+                    animated_position.y as f32,
+                    animated_position.z as f32,
                 ]);
 
                 ui.painter()
@@ -878,27 +1046,31 @@ impl eframe::App for ViewerApp {
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     if ui.button("<< Reset").clicked() {
-                                        self.current_step = 0;
+                                        self.goto_step(0);
                                     }
                                     if ui.button("< Step").clicked() {
                                         self.step_backward();
+                                    }
+                                    if ui.button(if self.playing { "Pause" } else { "Play" })
+                                        .clicked()
+                                    {
+                                        self.playing = !self.playing;
                                     }
                                     if ui.button("Step >").clicked() {
                                         self.step_forward();
                                     }
                                     if ui.button("End >>").clicked() {
-                                        self.current_step = self.entries.len().saturating_sub(1);
+                                        self.goto_step(self.entries.len().saturating_sub(1));
                                     }
                                     ui.separator();
-                                    ui.label(format!(
-                                        "Step {} / {}  (arrow keys also work)",
-                                        self.current_step.saturating_add(1).min(self.entries.len()),
-                                        self.entries.len()
-                                    ));
-                                    if let Some(entry) = self.entries.get(self.current_step) {
-                                        ui.separator();
-                                        ui.monospace(describe_output(&entry.output));
-                                    }
+                                    ui.label("Speed");
+                                    ui.add(
+                                        egui::Slider::new(&mut self.speed, 0.1..=4.0)
+                                            .fixed_decimals(1)
+                                            .suffix("x"),
+                                    );
+                                    ui.separator();
+                                    ui.label("arrow keys/space also work");
                                 });
                             });
                     });
