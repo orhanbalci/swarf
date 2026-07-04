@@ -601,14 +601,16 @@ impl ViewerApp {
             .as_ref()
             .expect("viewer requires the wgpu backend (see NativeOptions in main())");
         let axis_vertices = geometry::axis_vertices(scene.suggested_axis_length());
-        let sphere_vertices = geometry::sphere_vertices(scene.suggested_marker_radius());
+        let origin_vertices = geometry::sphere_vertices(scene.suggested_marker_radius());
+        let tool_vertices = geometry::spindle_marker_vertices(scene.suggested_tool_marker_radius());
         let axis_vertex_count = axis_vertices.len() as u32;
         let resources = PathRenderResources::new(
             &render_state.device,
             render_state.target_format,
             &scene.vertices,
             &axis_vertices,
-            &sphere_vertices,
+            &origin_vertices,
+            &tool_vertices,
         );
         render_state
             .renderer
@@ -798,6 +800,15 @@ impl eframe::App for ViewerApp {
                     .unwrap_or(0..0);
                 let full_range = 0..self.scene.vertices.len() as u32;
 
+                // Only show the tool-head marker once at least one step
+                // has resolved - before that there's no meaningful "tool
+                // tip position" yet, just the machine's power-on default.
+                let tool_position = (self.current_step < self.entries.len()).then_some([
+                    status.state.position.x as f32,
+                    status.state.position.y as f32,
+                    status.state.position.z as f32,
+                ]);
+
                 ui.painter()
                     .add(eframe::egui_wgpu::Callback::new_paint_callback(
                         rect,
@@ -808,6 +819,7 @@ impl eframe::App for ViewerApp {
                             so_far_range: 0..so_far_end,
                             current_range,
                             axis_vertex_count: self.axis_vertex_count,
+                            tool_position,
                         },
                     ));
 

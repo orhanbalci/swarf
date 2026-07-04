@@ -315,6 +315,81 @@ pub fn sphere_vertices(radius: f64) -> Vec<Vertex> {
     vertices
 }
 
+/// Build a small "spindle head" shape (`TriangleList`, position-only,
+/// same convention as [`sphere_vertices`]) for the tool-position marker:
+/// a tapered cone tip with a narrower cylindrical shank above it,
+/// reading as a tool bit rather than a generic blob. The apex sits at
+/// the local origin - `renderer.rs` translates that point to the
+/// current tool tip position, so the marker's apex is exactly where the
+/// tool tip actually is, with the "body" extending upward from there.
+pub fn spindle_marker_vertices(radius: f64) -> Vec<Vertex> {
+    const SEGMENTS: usize = 20;
+    const TAU: f64 = std::f64::consts::TAU;
+
+    let cone_radius = radius;
+    let cone_height = radius * 1.6;
+    let shank_radius = radius * 0.5;
+    let shank_height = radius * 1.8;
+
+    let ring = |z: f64, r: f64| -> Vec<[f32; 3]> {
+        (0..SEGMENTS)
+            .map(|i| {
+                let angle = TAU * i as f64 / SEGMENTS as f64;
+                [
+                    (r * angle.cos()) as f32,
+                    (r * angle.sin()) as f32,
+                    z as f32,
+                ]
+            })
+            .collect()
+    };
+    let vert = |position: [f32; 3]| -> Vertex {
+        Vertex {
+            position,
+            color: [1.0, 1.0, 1.0], // unused - marker pipeline always uses a uniform tint
+        }
+    };
+
+    let apex = [0.0f32, 0.0, 0.0];
+    let cone_base = ring(cone_height, cone_radius);
+    let shank_base = ring(cone_height, shank_radius);
+    let shank_top_ring = ring(cone_height + shank_height, shank_radius);
+    let shank_top_center = [0.0f32, 0.0, (cone_height + shank_height) as f32];
+
+    let mut vertices = Vec::with_capacity(SEGMENTS * 9);
+    for i in 0..SEGMENTS {
+        let j = (i + 1) % SEGMENTS;
+
+        // Cone side: apex to the cutting-tip base circle.
+        vertices.push(vert(apex));
+        vertices.push(vert(cone_base[i]));
+        vertices.push(vert(cone_base[j]));
+
+        // Shoulder: the flat step from the (wider) cone base up to the
+        // (narrower) shank base, closing the cone/shank junction.
+        vertices.push(vert(cone_base[i]));
+        vertices.push(vert(shank_base[i]));
+        vertices.push(vert(shank_base[j]));
+        vertices.push(vert(cone_base[i]));
+        vertices.push(vert(shank_base[j]));
+        vertices.push(vert(cone_base[j]));
+
+        // Shank side: the cylindrical body above the tip.
+        vertices.push(vert(shank_base[i]));
+        vertices.push(vert(shank_top_ring[i]));
+        vertices.push(vert(shank_top_ring[j]));
+        vertices.push(vert(shank_base[i]));
+        vertices.push(vert(shank_top_ring[j]));
+        vertices.push(vert(shank_base[j]));
+
+        // Shank top cap.
+        vertices.push(vert(shank_top_center));
+        vertices.push(vert(shank_top_ring[j]));
+        vertices.push(vert(shank_top_ring[i]));
+    }
+    vertices
+}
+
 /// The full precomputed scene: every resolved segment in emission
 /// order, plus the vertex range each trace step contributed (empty for
 /// steps with no geometry, e.g. a spindle command).
@@ -376,10 +451,18 @@ impl Scene {
         dx.max(dy).max(dz).max(1.0)
     }
 
-    /// A reasonable radius for `sphere_vertices` given this scene's
-    /// extent - small enough not to dominate the view, but not so small
-    /// it disappears at typical zoom levels.
+    /// A reasonable radius for `sphere_vertices` (the origin marker)
+    /// given this scene's extent - small enough not to dominate the
+    /// view, but not so small it disappears at typical zoom levels.
     pub fn suggested_marker_radius(&self) -> f64 {
-        (self.suggested_axis_length() * 0.015).max(0.5)
+        (self.suggested_axis_length() * 0.01).max(0.4)
+    }
+
+    /// A reasonable radius for `spindle_marker_vertices` (the tool-tip
+    /// marker) - smaller than the origin marker, since the cone+shank
+    /// shape already reads as taller/bulkier than a sphere of the same
+    /// radius (its total height is over 3x the radius).
+    pub fn suggested_tool_marker_radius(&self) -> f64 {
+        (self.suggested_axis_length() * 0.006).max(0.25)
     }
 }

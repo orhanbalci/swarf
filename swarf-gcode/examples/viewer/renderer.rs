@@ -123,6 +123,17 @@ impl Mat4 {
         ])
     }
 
+    /// A pure translation matrix - used to reposition shared,
+    /// origin-centered geometry (e.g. the marker sphere) elsewhere in
+    /// the scene without touching its vertex data.
+    fn translation(t: [f32; 3]) -> Mat4 {
+        let mut m = Mat4::identity();
+        m.0[3][0] = t[0];
+        m.0[3][1] = t[1];
+        m.0[3][2] = t[2];
+        m
+    }
+
     /// Orthographic projection, wgpu's [0, 1] depth range.
     #[allow(clippy::too_many_arguments)]
     fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
@@ -272,6 +283,11 @@ const SLOT_COUNT: u64 = 4;
 const GHOST_COLOR: [f32; 4] = [0.35, 0.35, 0.35, 1.0];
 const CURRENT_COLOR: [f32; 4] = [1.0, 0.85, 0.1, 1.0];
 const SPHERE_COLOR: [f32; 4] = [1.0, 0.55, 0.15, 1.0];
+const TOOL_MARKER_COLOR: [f32; 4] = [0.15, 0.9, 1.0, 1.0];
+
+const ORIGIN_SLOT: u32 = 0;
+const TOOL_SLOT: u32 = 1;
+const SOLID_SLOT_COUNT: u64 = 2;
 
 const GHOST_THICKNESS_PX: f32 = 1.4;
 const SO_FAR_THICKNESS_PX: f32 = 3.0;
@@ -366,9 +382,12 @@ pub struct PathRenderResources {
     line_bind_group: wgpu::BindGroup,
 
     solid_pipeline: wgpu::RenderPipeline,
-    sphere_vertex_buffer: wgpu::Buffer,
-    sphere_vertex_count: u32,
+    origin_vertex_buffer: wgpu::Buffer,
+    origin_vertex_count: u32,
+    tool_vertex_buffer: wgpu::Buffer,
+    tool_vertex_count: u32,
     solid_uniform_buffer: wgpu::Buffer,
+    solid_uniform_slot_stride: u64,
     solid_bind_group: wgpu::BindGroup,
 }
 
@@ -440,7 +459,8 @@ impl PathRenderResources {
         target_format: wgpu::TextureFormat,
         path_vertices: &[LineVertex],
         axis_vertices: &[LineVertex],
-        sphere_vertices: &[Vertex],
+        origin_vertices: &[Vertex],
+        tool_vertices: &[Vertex],
     ) -> Self {
         use wgpu::util::DeviceExt as _;
 
@@ -554,6 +574,7 @@ impl PathRenderResources {
         });
 
         let solid_uniform_size = std::mem::size_of::<SolidUniforms>() as u64;
+        let solid_uniform_slot_stride = solid_uniform_size.div_ceil(alignment) * alignment;
 
         let solid_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -563,7 +584,7 @@ impl PathRenderResources {
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        has_dynamic_offset: true,
                         min_binding_size: wgpu::BufferSize::new(solid_uniform_size),
                     },
                     count: None,
@@ -610,15 +631,21 @@ impl PathRenderResources {
             cache: None,
         });
 
-        let sphere_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("viewer.sphere_vertex_buffer"),
-            contents: bytemuck::cast_slice(sphere_vertices),
+        let origin_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("viewer.origin_vertex_buffer"),
+            contents: bytemuck::cast_slice(origin_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let tool_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("viewer.tool_vertex_buffer"),
+            contents: bytemuck::cast_slice(tool_vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
 
         let solid_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("viewer.solid_uniform_buffer"),
-            size: solid_uniform_size,
+            size: solid_uniform_slot_stride * SOLID_SLOT_COUNT,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -628,7 +655,11 @@ impl PathRenderResources {
             layout: &solid_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: solid_uniform_buffer.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &solid_uniform_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(solid_uniform_size),
+                }),
             }],
         });
 
@@ -640,9 +671,12 @@ impl PathRenderResources {
             line_uniform_slot_stride,
             line_bind_group,
             solid_pipeline,
-            sphere_vertex_buffer,
-            sphere_vertex_count: sphere_vertices.len() as u32,
+            origin_vertex_buffer,
+            origin_vertex_count: origin_vertices.len() as u32,
+            tool_vertex_buffer,
+            tool_vertex_count: tool_vertices.len() as u32,
             solid_uniform_buffer,
+            solid_uniform_slot_stride,
             solid_bind_group,
         }
     }
@@ -708,7 +742,7 @@ impl PathRenderResources {
         );
     }
 
-    fn write_solid_uniforms(&self, queue: &wgpu::Queue, mvp: Mat4, tint: [f32; 4]) {
+    fn write_solid_slot(&self, queue: &wgpu::Queue, slot: u32, mvp: Mat4, tint: [f32; 4]) {
         let uniforms = SolidUniforms {
             mvp: mvp.0,
             override_color: 1,
@@ -717,17 +751,33 @@ impl PathRenderResources {
             _padding2: 0,
             tint,
         };
-        queue.write_buffer(&self.solid_uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        let offset = slot as u64 * self.solid_uniform_slot_stride;
+        queue.write_buffer(&self.solid_uniform_buffer, offset, bytemuck::bytes_of(&uniforms));
     }
 
-    fn draw_sphere(&self, render_pass: &mut wgpu::RenderPass<'_>) {
-        if self.sphere_vertex_count == 0 {
+    fn draw_marker(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        slot: u32,
+        buffer: &wgpu::Buffer,
+        vertex_count: u32,
+    ) {
+        if vertex_count == 0 {
             return;
         }
+        let offset = slot * self.solid_uniform_slot_stride as u32;
         render_pass.set_pipeline(&self.solid_pipeline);
-        render_pass.set_bind_group(0, &self.solid_bind_group, &[]);
-        render_pass.set_vertex_buffer(0, self.sphere_vertex_buffer.slice(..));
-        render_pass.draw(0..self.sphere_vertex_count, 0..1);
+        render_pass.set_bind_group(0, &self.solid_bind_group, &[offset]);
+        render_pass.set_vertex_buffer(0, buffer.slice(..));
+        render_pass.draw(0..vertex_count, 0..1);
+    }
+
+    fn draw_origin_marker(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_marker(render_pass, ORIGIN_SLOT, &self.origin_vertex_buffer, self.origin_vertex_count);
+    }
+
+    fn draw_tool_marker(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_marker(render_pass, TOOL_SLOT, &self.tool_vertex_buffer, self.tool_vertex_count);
     }
 }
 
@@ -739,6 +789,10 @@ pub struct PathPaintCallback {
     pub so_far_range: std::ops::Range<u32>,
     pub current_range: std::ops::Range<u32>,
     pub axis_vertex_count: u32,
+    /// Where to draw the tool-head marker sphere right now (the current
+    /// step's resolved tool tip position) - `None` before any motion
+    /// has resolved yet, in which case only the origin marker is drawn.
+    pub tool_position: Option<[f32; 3]>,
 }
 
 impl egui_wgpu::CallbackTrait for PathPaintCallback {
@@ -787,7 +841,11 @@ impl egui_wgpu::CallbackTrait for PathPaintCallback {
             self.viewport,
             [0.0; 4],
         );
-        resources.write_solid_uniforms(queue, self.mvp, SPHERE_COLOR);
+        resources.write_solid_slot(queue, ORIGIN_SLOT, self.mvp, SPHERE_COLOR);
+        if let Some(pos) = self.tool_position {
+            let tool_mvp = self.mvp.mul(&Mat4::translation(pos));
+            resources.write_solid_slot(queue, TOOL_SLOT, tool_mvp, TOOL_MARKER_COLOR);
+        }
         Vec::new()
     }
 
@@ -803,6 +861,9 @@ impl egui_wgpu::CallbackTrait for PathPaintCallback {
         resources.draw_path(render_pass, GHOST_SLOT, self.full_range.clone());
         resources.draw_path(render_pass, SO_FAR_SLOT, self.so_far_range.clone());
         resources.draw_path(render_pass, CURRENT_SLOT, self.current_range.clone());
-        resources.draw_sphere(render_pass);
+        resources.draw_origin_marker(render_pass);
+        if self.tool_position.is_some() {
+            resources.draw_tool_marker(render_pass);
+        }
     }
 }
