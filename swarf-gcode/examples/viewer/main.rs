@@ -754,7 +754,24 @@ impl eframe::App for ViewerApp {
                 let (rect, response) =
                     ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
-                if response.dragged() {
+                if response.dragged_by(egui::PointerButton::Secondary) {
+                    let delta = response.drag_delta();
+                    self.camera.pan(
+                        [
+                            self.scene.bounds_min.x as f32,
+                            self.scene.bounds_min.y as f32,
+                            self.scene.bounds_min.z as f32,
+                        ],
+                        [
+                            self.scene.bounds_max.x as f32,
+                            self.scene.bounds_max.y as f32,
+                            self.scene.bounds_max.z as f32,
+                        ],
+                        rect.width() / rect.height().max(1.0),
+                        [rect.width(), rect.height()],
+                        [delta.x, delta.y],
+                    );
+                } else if response.dragged() {
                     const ROTATE_SPEED: f32 = 0.005;
                     let delta = response.drag_delta();
                     self.camera

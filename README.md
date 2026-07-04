@@ -168,6 +168,18 @@ cd swarf-gcode
 cargo run --example trace -- examples/gcode_samples/arc_rword_test.gcode
 ```
 
+There's also a step-through 3D toolpath viewer at
+`swarf-gcode/examples/viewer/`: it interprets a whole program up front, then
+lets you step forward/backward through the resolved output while the
+toolpath draws itself and the source line highlights in sync.
+
+![swarf-gcode viewer stepping through rust_logo.gcode](swarf-gcode/examples/viewer/viewer-screenshot.png)
+
+```bash
+cd swarf-gcode
+cargo run --example viewer -- examples/gcode_samples/rust_logo.gcode
+```
+
 ### Module map
 
 | Module         | Responsibility                                                        |

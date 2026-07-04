@@ -33,3 +33,27 @@ Files included, and roughly what each one is useful for testing:
 
 See `examples/trace.rs`'s module docs for how to run these through the
 interpreter's trace tool.
+
+## `rust_logo.gcode`
+
+Not from UGS. Generated with [svg2gcode](https://github.com/sameer/svg2gcode)
+from the Rust logo SVG in
+[simple-icons](https://github.com/simple-icons/simple-icons/blob/develop/icons/rust.svg),
+which is released under
+[CC0 1.0](https://github.com/simple-icons/simple-icons/blob/develop/LICENSE.md)
+(public domain, no attribution required). Exercises G2/G3 R-word arcs on a
+real closed-contour toolpath (gear ring, R cutout, mounting bolts) with no
+fill/relief artifacts.
+
+svg2gcode's raw output is single-depth (pen-plotter/laser style: one M3/M5
+per contour, no Z motion at all), which isn't a real cut - so each of the
+10 contours was reworked into 2 full-depth routing passes (Z-2.5, Z-5.2mm)
+to actually cut through 5mm stock, with a distinct plunge feed rate (300
+mm/min) from the cutting feed rate (1000 mm/min).
+
+Contours are also ordered interior-features-first, outer-perimeter-last:
+the outer gear ring is the only contour whose through-cut fully separates
+the part from the surrounding stock, so it runs last - cutting it first
+would leave the part loose (free to shift/vibrate under the bit) while
+the interior features (R cutout, mounting bolt holes) still had cutting
+left to do.

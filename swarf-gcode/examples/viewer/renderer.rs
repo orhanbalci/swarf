@@ -61,6 +61,27 @@ use eframe::egui_wgpu::{self, wgpu};
 
 use crate::geometry::{LineVertex, Vertex};
 
+// Tiny `[f32; 3]` vector helpers - shared by `Mat4::look_at` and the
+// orbit camera's pan math, which both need a right-handed basis from a
+// forward/up pair.
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn normalize(a: [f32; 3]) -> [f32; 3] {
+    let len = dot(a, a).sqrt();
+    [a[0] / len, a[1] / len, a[2] / len]
+}
+
 /// Bare-bones column-major 4x4 matrix (matching WGSL's `mat4x4`
 /// layout) - hand-rolled instead of pulling in a math crate for the
 /// one matrix this example needs.
@@ -93,24 +114,6 @@ impl Mat4 {
 
     /// Right-handed look-at view matrix.
     fn look_at(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> Mat4 {
-        fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-            [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-        }
-        fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-            a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-        }
-        fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-            [
-                a[1] * b[2] - a[2] * b[1],
-                a[2] * b[0] - a[0] * b[2],
-                a[0] * b[1] - a[1] * b[0],
-            ]
-        }
-        fn normalize(a: [f32; 3]) -> [f32; 3] {
-            let len = dot(a, a).sqrt();
-            [a[0] / len, a[1] / len, a[2] / len]
-        }
-
         let f = normalize(sub(target, eye)); // forward
         let s = normalize(cross(f, up)); // right
         let u = cross(s, f); // recomputed up
@@ -164,6 +167,11 @@ pub struct OrbitCamera {
     pub yaw: f32,
     pub pitch: f32,
     pub zoom: f32,
+    /// World-space offset added to the scene-bounds-derived look-at
+    /// center - lets the user pan away from the toolpath's centroid
+    /// without disturbing the "always frame the toolpath" fit that
+    /// `zoom`/rotation build on top of.
+    pub pan_offset: [f32; 3],
 }
 
 /// Keeps the eye direction away from parallel-to-up, where `look_at`
@@ -179,6 +187,7 @@ impl OrbitCamera {
             yaw: std::f32::consts::FRAC_PI_4,
             pitch: (1.0 / 2.0f32.sqrt()).atan(),
             zoom: 1.0,
+            pan_offset: [0.0; 3],
         }
     }
 
@@ -189,6 +198,40 @@ impl OrbitCamera {
 
     pub fn zoom_by(&mut self, factor: f32) {
         self.zoom = (self.zoom * factor).clamp(0.05, 20.0);
+    }
+
+    /// Shift the look-at target by a screen-space drag: `delta_px` is
+    /// the pointer movement in pixels (screen +y is down), converted to
+    /// a world-space offset using this camera's current right/up basis
+    /// and the same bounds-derived scale `view_projection` uses, so
+    /// panning tracks the cursor 1:1 regardless of zoom level.
+    pub fn pan(
+        &mut self,
+        bounds_min: [f32; 3],
+        bounds_max: [f32; 3],
+        aspect_ratio: f32,
+        viewport_px: [f32; 2],
+        delta_px: [f32; 2],
+    ) {
+        let radius = scene_radius(bounds_min, bounds_max) * self.zoom;
+        let (half_h, half_w) = if aspect_ratio >= 1.0 {
+            (radius, radius * aspect_ratio)
+        } else {
+            (radius / aspect_ratio, radius)
+        };
+        let world_per_px_x = (2.0 * half_w) / viewport_px[0].max(1.0);
+        let world_per_px_y = (2.0 * half_h) / viewport_px[1].max(1.0);
+
+        let (right, up) = self.right_up();
+
+        // Dragging the canvas should feel like grabbing the content:
+        // moving the pointer right/down should reveal what's to the
+        // left/above, so the look-at target moves the opposite way.
+        let dx = -delta_px[0] * world_per_px_x;
+        let dy = delta_px[1] * world_per_px_y;
+        for i in 0..3 {
+            self.pan_offset[i] += right[i] * dx + up[i] * dy;
+        }
     }
 
     /// Straight-down top view of the XY plane. Looking exactly along Z
@@ -218,6 +261,37 @@ impl OrbitCamera {
         // Z-up, matching G-code convention (Z is the spindle axis).
         [cos_pitch * cos_yaw, cos_pitch * sin_yaw, sin_pitch]
     }
+
+    /// This camera's current on-screen right/up basis vectors, in world
+    /// space - same near-vertical fallback as `view_projection`'s `up`
+    /// selection, so panning stays consistent with what's on screen at
+    /// the straight-down/up preset views.
+    fn right_up(&self) -> ([f32; 3], [f32; 3]) {
+        let eye_dir = self.eye_direction();
+        let forward = [-eye_dir[0], -eye_dir[1], -eye_dir[2]];
+        let world_up = if eye_dir[0].abs() < 1e-3 && eye_dir[1].abs() < 1e-3 {
+            [0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        let right = normalize(cross(forward, world_up));
+        let up = cross(right, forward);
+        (right, up)
+    }
+}
+
+/// Radius of a sphere containing the whole bounding box - simplest way
+/// to guarantee it fits regardless of viewing angle. Shared by
+/// `view_projection` (to size the orthographic frustum) and
+/// `OrbitCamera::pan` (to convert a screen-space drag into world units
+/// at the same scale).
+fn scene_radius(bounds_min: [f32; 3], bounds_max: [f32; 3]) -> f32 {
+    let extent = [
+        (bounds_max[0] - bounds_min[0]).max(1.0),
+        (bounds_max[1] - bounds_min[1]).max(1.0),
+        (bounds_max[2] - bounds_min[2]).max(1.0),
+    ];
+    ((extent[0].powi(2) + extent[1].powi(2) + extent[2].powi(2)).sqrt() / 2.0).max(1.0) * 1.15
 }
 
 /// View + orthographic projection for `camera`, framed to fully contain
@@ -230,19 +304,11 @@ pub fn view_projection(
     camera: &OrbitCamera,
 ) -> Mat4 {
     let center = [
-        (bounds_min[0] + bounds_max[0]) / 2.0,
-        (bounds_min[1] + bounds_max[1]) / 2.0,
-        (bounds_min[2] + bounds_max[2]) / 2.0,
+        (bounds_min[0] + bounds_max[0]) / 2.0 + camera.pan_offset[0],
+        (bounds_min[1] + bounds_max[1]) / 2.0 + camera.pan_offset[1],
+        (bounds_min[2] + bounds_max[2]) / 2.0 + camera.pan_offset[2],
     ];
-    let extent = [
-        (bounds_max[0] - bounds_min[0]).max(1.0),
-        (bounds_max[1] - bounds_min[1]).max(1.0),
-        (bounds_max[2] - bounds_min[2]).max(1.0),
-    ];
-    // Radius of a sphere containing the whole box - simplest way to
-    // guarantee the box fits regardless of viewing angle.
-    let base_radius =
-        ((extent[0].powi(2) + extent[1].powi(2) + extent[2].powi(2)).sqrt() / 2.0).max(1.0) * 1.15; // 15% margin
+    let base_radius = scene_radius(bounds_min, bounds_max);
     let radius = base_radius * camera.zoom;
 
     let eye_dir = camera.eye_direction();
