@@ -1,17 +1,48 @@
-//! Turns a recorded interpretation trace into renderable line-segment
-//! geometry: one big vertex buffer (line list) built once at load time,
-//! plus the vertex range each step contributed, so the viewer can slice
-//! out "path so far" / "current step" every frame without
-//! re-tessellating anything.
+//! Turns a recorded interpretation trace into renderable geometry: one
+//! big vertex buffer built once at load time, plus the vertex range
+//! each step contributed, so the viewer can slice out "path so far" /
+//! "current step" every frame without re-tessellating anything.
+//!
+//! Two vertex formats are used:
+//!
+//!   - [`LineVertex`] for the toolpath and axes. `wgpu`/WebGPU has no
+//!     portable "line width" control for `LineList` geometry, so
+//!     drawing anything other than hairline-thin paths means expanding
+//!     each segment into a camera-facing quad ourselves. Rather than
+//!     bake a fixed thickness into these vertices (which would prevent
+//!     drawing the SAME geometry thin for the "ghost" pass and thick
+//!     for "so far"/"current" - see `renderer.rs`), each vertex carries
+//!     its own position, its segment's OTHER endpoint, and a `side`
+//!     sign; the actual thickening happens in the vertex shader using a
+//!     per-draw-call thickness uniform, in screen space.
+//!   - [`Vertex`] (plain position + color, `TriangleList`) for ordinary
+//!     solid 3D geometry - currently just the small origin marker
+//!     sphere, which needs real filled geometry, not a thickened line.
 
 use std::ops::Range;
 
 use swarf_gcode::{LineOutput, MotionMode, Position, ResolvedMotionCommand};
 
+/// Plain solid-geometry vertex: position + color, rendered with a
+/// direct MVP transform and no thickening - see this module's docs.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
+    pub color: [f32; 3],
+}
+
+/// A thick-line vertex: this vertex's own position, its segment's
+/// other endpoint (so the vertex shader can compute the segment's
+/// on-screen direction), and which side of the line ([-1.0, 1.0]) this
+/// vertex should be pushed toward once thickened - see this module's
+/// docs and `renderer.rs`'s vertex shader.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LineVertex {
+    pub position: [f32; 3],
+    pub other: [f32; 3],
+    pub side: f32,
     pub color: [f32; 3],
 }
 
@@ -84,22 +115,36 @@ fn from_plane(u: f64, v: f64, linear: f64, plane: Plane) -> Position {
     }
 }
 
-fn to_vertex(p: Position, color: [f32; 3]) -> Vertex {
-    Vertex {
-        position: [p.x as f32, p.y as f32, p.z as f32],
+fn to_line_vertex(position: Position, other: Position, side: f32, color: [f32; 3]) -> LineVertex {
+    LineVertex {
+        position: [position.x as f32, position.y as f32, position.z as f32],
+        other: [other.x as f32, other.y as f32, other.z as f32],
+        side,
         color,
     }
 }
 
-fn push_segment(vertices: &mut Vec<Vertex>, a: Position, b: Position, color: [f32; 3]) {
-    vertices.push(to_vertex(a, color));
-    vertices.push(to_vertex(b, color));
+/// Expand one segment (`a` -> `b`) into a quad (2 triangles, 6
+/// vertices, non-indexed) - the thickening itself happens later, in the
+/// vertex shader, using each vertex's `side` and `other` fields.
+fn push_segment(vertices: &mut Vec<LineVertex>, a: Position, b: Position, color: [f32; 3]) {
+    let a_neg = to_line_vertex(a, b, -1.0, color);
+    let a_pos = to_line_vertex(a, b, 1.0, color);
+    let b_neg = to_line_vertex(b, a, -1.0, color);
+    let b_pos = to_line_vertex(b, a, 1.0, color);
+    vertices.push(a_neg);
+    vertices.push(a_pos);
+    vertices.push(b_neg);
+    vertices.push(a_pos);
+    vertices.push(b_pos);
+    vertices.push(b_neg);
 }
 
-/// Tessellate one resolved move into line-list vertices (2 per segment,
-/// no shared-index strip - simplest thing that's portable across
-/// backends, and the vertex count involved is trivial for a toolpath).
-fn push_motion(vertices: &mut Vec<Vertex>, m: &ResolvedMotionCommand) {
+/// Tessellate one resolved move into thick-line quads. The vertex count
+/// per segment (6, vs. 2 for a plain line list) is irrelevant for a
+/// toolpath's scale - even a large real-world file stays well within
+/// trivial limits for any GPU.
+fn push_motion(vertices: &mut Vec<LineVertex>, m: &ResolvedMotionCommand) {
     let color = if m.motion_mode == MotionMode::Rapid {
         RAPID_COLOR
     } else {
@@ -174,12 +219,112 @@ pub struct TraceEntry {
     pub output: LineOutput,
 }
 
+const AXIS_X_COLOR: [f32; 3] = [1.0, 0.25, 0.25];
+const AXIS_Y_COLOR: [f32; 3] = [0.25, 1.0, 0.25];
+const AXIS_Z_COLOR: [f32; 3] = [0.35, 0.55, 1.0];
+
+/// Build thick-line quads for X/Y/Z reference axes through the machine
+/// origin, each `length` long - red/green/blue by the usual CAD
+/// convention. Kept as its own small, separate geometry (not part of
+/// `Scene::vertices`) since axes should always be fully visible
+/// regardless of the current step, unlike the toolpath itself.
+pub fn axis_vertices(length: f64) -> Vec<LineVertex> {
+    let origin = Position {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    let mut vertices = Vec::with_capacity(18);
+    push_segment(
+        &mut vertices,
+        origin,
+        Position {
+            x: length,
+            y: 0.0,
+            z: 0.0,
+        },
+        AXIS_X_COLOR,
+    );
+    push_segment(
+        &mut vertices,
+        origin,
+        Position {
+            x: 0.0,
+            y: length,
+            z: 0.0,
+        },
+        AXIS_Y_COLOR,
+    );
+    push_segment(
+        &mut vertices,
+        origin,
+        Position {
+            x: 0.0,
+            y: 0.0,
+            z: length,
+        },
+        AXIS_Z_COLOR,
+    );
+    vertices
+}
+
+/// Build a small UV sphere (`TriangleList`, position-only - color comes
+/// from a uniform tint at render time, see `renderer.rs`) centered on
+/// the origin, marking it clearly in 3D regardless of viewing angle
+/// (unlike the axes, which vanish end-on from some angles).
+pub fn sphere_vertices(radius: f64) -> Vec<Vertex> {
+    const LON_SEGMENTS: usize = 16;
+    const LAT_SEGMENTS: usize = 10;
+    const TAU: f64 = std::f64::consts::TAU;
+    const PI: f64 = std::f64::consts::PI;
+
+    let point = |theta: f64, phi: f64| -> Vertex {
+        Vertex {
+            position: [
+                (radius * theta.sin() * phi.cos()) as f32,
+                (radius * theta.sin() * phi.sin()) as f32,
+                (radius * theta.cos()) as f32,
+            ],
+            color: [1.0, 1.0, 1.0], // unused - sphere pipeline always uses a uniform tint
+        }
+    };
+
+    let mut vertices = Vec::with_capacity(LON_SEGMENTS * LAT_SEGMENTS * 6);
+    for lat in 0..LAT_SEGMENTS {
+        let theta0 = PI * lat as f64 / LAT_SEGMENTS as f64;
+        let theta1 = PI * (lat + 1) as f64 / LAT_SEGMENTS as f64;
+        for lon in 0..LON_SEGMENTS {
+            let phi0 = TAU * lon as f64 / LON_SEGMENTS as f64;
+            let phi1 = TAU * (lon + 1) as f64 / LON_SEGMENTS as f64;
+            // A quad per (lat, lon) cell, split into 2 triangles - the
+            // triangles at the poles (theta0=0 or theta1=PI) degenerate
+            // to zero area, which is harmless (just a few wasted
+            // vertices) for geometry this small.
+            let p00 = point(theta0, phi0);
+            let p10 = point(theta1, phi0);
+            let p11 = point(theta1, phi1);
+            let p01 = point(theta0, phi1);
+            vertices.push(p00);
+            vertices.push(p10);
+            vertices.push(p11);
+            vertices.push(p00);
+            vertices.push(p11);
+            vertices.push(p01);
+        }
+    }
+    vertices
+}
+
 /// The full precomputed scene: every resolved segment in emission
 /// order, plus the vertex range each trace step contributed (empty for
 /// steps with no geometry, e.g. a spindle command).
 pub struct Scene {
-    pub vertices: Vec<Vertex>,
+    pub vertices: Vec<LineVertex>,
     pub step_ranges: Vec<Range<u32>>,
+    /// Always includes the machine origin, even if the toolpath itself
+    /// doesn't come near it - both so the camera (fit to these bounds)
+    /// always frames the origin, and so a program with no motion at
+    /// all still has a sane, non-degenerate box to fit.
     pub bounds_min: Position,
     pub bounds_max: Position,
 }
@@ -189,15 +334,11 @@ impl Scene {
         let mut vertices = Vec::new();
         let mut step_ranges = Vec::with_capacity(entries.len());
         let mut bounds_min = Position {
-            x: f64::INFINITY,
-            y: f64::INFINITY,
-            z: f64::INFINITY,
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
         };
-        let mut bounds_max = Position {
-            x: f64::NEG_INFINITY,
-            y: f64::NEG_INFINITY,
-            z: f64::NEG_INFINITY,
-        };
+        let mut bounds_max = bounds_min;
 
         for entry in entries {
             let start = vertices.len() as u32;
@@ -216,27 +357,29 @@ impl Scene {
             step_ranges.push(start..end);
         }
 
-        if !bounds_min.x.is_finite() {
-            // No motion at all (e.g. a program with only M-codes) - fall
-            // back to a small default box so the camera has something
-            // sane to frame.
-            bounds_min = Position {
-                x: -10.0,
-                y: -10.0,
-                z: -10.0,
-            };
-            bounds_max = Position {
-                x: 10.0,
-                y: 10.0,
-                z: 10.0,
-            };
-        }
-
         Self {
             vertices,
             step_ranges,
             bounds_min,
             bounds_max,
         }
+    }
+
+    /// A reasonable length for `axis_vertices` given this scene's
+    /// extent - the largest of the (origin-inclusive) bounding box's
+    /// three dimensions, so each axis arm reaches roughly as far as the
+    /// toolpath does in whichever direction is largest.
+    pub fn suggested_axis_length(&self) -> f64 {
+        let dx = self.bounds_max.x - self.bounds_min.x;
+        let dy = self.bounds_max.y - self.bounds_min.y;
+        let dz = self.bounds_max.z - self.bounds_min.z;
+        dx.max(dy).max(dz).max(1.0)
+    }
+
+    /// A reasonable radius for `sphere_vertices` given this scene's
+    /// extent - small enough not to dominate the view, but not so small
+    /// it disappears at typical zoom levels.
+    pub fn suggested_marker_radius(&self) -> f64 {
+        (self.suggested_axis_length() * 0.015).max(0.5)
     }
 }

@@ -49,7 +49,7 @@ use swarf_gcode::{
 };
 
 use geometry::{Scene, TraceEntry};
-use renderer::{fit_view_projection, PathPaintCallback, PathRenderResources};
+use renderer::{view_projection, OrbitCamera, PathPaintCallback, PathRenderResources};
 
 /// Sink that records every resolved output alongside whichever source
 /// line was being fed to the interpreter when it was produced. The
@@ -341,7 +341,9 @@ struct ViewerApp {
     entries: Vec<TraceEntry>,
     errors: Vec<(usize, InterpretError)>,
     scene: Scene,
+    axis_vertex_count: u32,
     current_step: usize,
+    camera: OrbitCamera,
     /// Which line the table was last force-scrolled to - so
     /// `scroll_to_row` only fires when the highlighted line actually
     /// changes, instead of fighting the user's manual scrolling every
@@ -358,10 +360,15 @@ impl ViewerApp {
             .wgpu_render_state
             .as_ref()
             .expect("viewer requires the wgpu backend (see NativeOptions in main())");
+        let axis_vertices = geometry::axis_vertices(scene.suggested_axis_length());
+        let sphere_vertices = geometry::sphere_vertices(scene.suggested_marker_radius());
+        let axis_vertex_count = axis_vertices.len() as u32;
         let resources = PathRenderResources::new(
             &render_state.device,
             render_state.target_format,
             &scene.vertices,
+            &axis_vertices,
+            &sphere_vertices,
         );
         render_state
             .renderer
@@ -374,7 +381,9 @@ impl ViewerApp {
             entries,
             errors,
             scene,
+            axis_vertex_count,
             current_step: 0,
+            camera: OrbitCamera::default_isometric(),
             last_scrolled_line: None,
         }
     }
@@ -401,32 +410,8 @@ impl eframe::App for ViewerApp {
             }
         });
 
-        egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("<< Reset").clicked() {
-                    self.current_step = 0;
-                }
-                if ui.button("< Step").clicked() {
-                    self.step_backward();
-                }
-                if ui.button("Step >").clicked() {
-                    self.step_forward();
-                }
-                if ui.button("End >>").clicked() {
-                    self.current_step = self.entries.len().saturating_sub(1);
-                }
-                ui.separator();
-                ui.label(format!(
-                    "Step {} / {}  (arrow keys also work)",
-                    self.current_step.saturating_add(1).min(self.entries.len()),
-                    self.entries.len()
-                ));
-                if let Some(entry) = self.entries.get(self.current_step) {
-                    ui.separator();
-                    ui.monospace(describe_output(&entry.output));
-                }
-            });
-            if !self.errors.is_empty() {
+        if !self.errors.is_empty() {
+            egui::TopBottomPanel::top("errors").show(ctx, |ui| {
                 ui.colored_label(
                     egui::Color32::from_rgb(220, 80, 80),
                     format!(
@@ -434,8 +419,8 @@ impl eframe::App for ViewerApp {
                         self.errors.len()
                     ),
                 );
-            }
-        });
+            });
+        }
 
         let current_line = self.entries.get(self.current_step).map(|e| e.line);
 
@@ -506,11 +491,28 @@ impl eframe::App for ViewerApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::Frame::canvas(ui.style()).show(ui, |ui| {
-                let (rect, _response) =
-                    ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+                let (rect, response) =
+                    ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+
+                if response.dragged() {
+                    const ROTATE_SPEED: f32 = 0.005;
+                    let delta = response.drag_delta();
+                    self.camera
+                        .orbit(delta.x * ROTATE_SPEED, delta.y * ROTATE_SPEED);
+                }
+                if response.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll != 0.0 {
+                        // Scrolling up (positive delta) zooms in, so the
+                        // multiplier on `camera.zoom` (which scales the
+                        // projection's half-extents) must shrink then.
+                        self.camera.zoom_by((-scroll * 0.002).exp());
+                    }
+                }
+
                 let aspect = rect.width() / rect.height().max(1.0);
 
-                let mvp = fit_view_projection(
+                let mvp = view_projection(
                     [
                         self.scene.bounds_min.x as f32,
                         self.scene.bounds_min.y as f32,
@@ -522,6 +524,7 @@ impl eframe::App for ViewerApp {
                         self.scene.bounds_max.z as f32,
                     ],
                     aspect,
+                    &self.camera,
                 );
 
                 let so_far_end = self
@@ -542,11 +545,76 @@ impl eframe::App for ViewerApp {
                         rect,
                         PathPaintCallback {
                             mvp,
+                            viewport: [rect.width(), rect.height()],
                             full_range,
                             so_far_range: 0..so_far_end,
                             current_range,
+                            axis_vertex_count: self.axis_vertex_count,
                         },
                     ));
+
+                // A floating overlay drawn directly on the canvas rather
+                // than in the top toolbar - `Area` renders in its own
+                // layer above whatever `ui.painter()` drew into this
+                // `Ui`, so it sits on top of the wgpu callback's output.
+                egui::Area::new(egui::Id::new("camera_overlay"))
+                    .fixed_pos(rect.left_top() + egui::vec2(8.0, 8.0))
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style())
+                            .inner_margin(egui::Margin::same(4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Iso").clicked() {
+                                        self.camera = OrbitCamera::default_isometric();
+                                    }
+                                    if ui.button("XY").clicked() {
+                                        self.camera.view_xy();
+                                    }
+                                    if ui.button("XZ").clicked() {
+                                        self.camera.view_xz();
+                                    }
+                                    if ui.button("YZ").clicked() {
+                                        self.camera.view_yz();
+                                    }
+                                });
+                            });
+                    });
+
+                egui::Area::new(egui::Id::new("program_controls_overlay"))
+                    .fixed_pos(egui::pos2(rect.center().x, rect.bottom() - 8.0))
+                    .pivot(egui::Align2::CENTER_BOTTOM)
+                    .order(egui::Order::Foreground)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style())
+                            .inner_margin(egui::Margin::same(4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if ui.button("<< Reset").clicked() {
+                                        self.current_step = 0;
+                                    }
+                                    if ui.button("< Step").clicked() {
+                                        self.step_backward();
+                                    }
+                                    if ui.button("Step >").clicked() {
+                                        self.step_forward();
+                                    }
+                                    if ui.button("End >>").clicked() {
+                                        self.current_step = self.entries.len().saturating_sub(1);
+                                    }
+                                    ui.separator();
+                                    ui.label(format!(
+                                        "Step {} / {}  (arrow keys also work)",
+                                        self.current_step.saturating_add(1).min(self.entries.len()),
+                                        self.entries.len()
+                                    ));
+                                    if let Some(entry) = self.entries.get(self.current_step) {
+                                        ui.separator();
+                                        ui.monospace(describe_output(&entry.output));
+                                    }
+                                });
+                            });
+                    });
             });
         });
     }
