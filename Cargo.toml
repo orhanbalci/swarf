@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "swarf-gcode",
+    "swarf-motion",
+    "swarf-bridge",
 ]
 
 [workspace.package]

@@ -1,0 +1,12 @@
+[package]
+name = "swarf-motion"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Trajectory/acceleration motion planner: look-ahead junction-velocity planning and arc tessellation, independent of any particular G-code (or other) motion source."
+
+[dependencies]
+# core::f64 has no sqrt/sin/cos/atan2 in no_std - libm provides them, same
+# as swarf-gcode's own dependency on it (see that crate's Cargo.toml for
+# the full rationale). Free-function calls (`libm::sqrt(x)`), not methods.
+libm = "0.2"
