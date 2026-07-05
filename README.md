@@ -18,18 +18,22 @@ The intended end-to-end pipeline, from serial bytes to real motion:
 Serial bytes
   │
   ▼
-[Interpreter]    ★      swarf-gcode (this repo): parses one line at a time
-  │                     (gcode crate's zero-allocation visitor API), mutates
-  │                     persistent modal state, validates modal-group
-  │                     conflicts, and emits an ordered stream of resolved
-  │                     output (moves AND non-motion commands, one sink,
-  │                     exact execution order preserved)
+[Interpreter]    ★      swarf-gcode: parses one line at a time (gcode crate's
+  │                     zero-allocation visitor API), mutates persistent
+  │                     modal state, validates modal-group conflicts, and
+  │                     emits an ordered stream of resolved output (moves AND
+  │                     non-motion commands, one sink, exact execution order
+  │                     preserved). No dependency on anything below it.
   ▼
-[Motion planner]        swarf-motion (planned): trajectory / acceleration
-  │                     planning, look-ahead junction velocities, arc/canned-
-  │                     cycle interpolation - this crate deliberately leaves
-  │                     arcs unflattened and canned cycles as plain rapid/
-  │                     feed legs so this layer owns that math
+[Bridge]         ★      swarf-bridge: thin adapter translating swarf-gcode's
+  │                     resolved output into swarf-motion's plain API - the
+  │                     ONE place that knows both layers exist, so neither
+  │                     lower crate has to depend on the other.
+  ▼
+[Motion planner] ★      swarf-motion: trajectory / acceleration planning,
+  │                     look-ahead junction velocities, chord-tolerance arc
+  │                     tessellation - generic over any motion source, not
+  │                     tied to G-code at all.
   ▼
 [Ring buffer]           bounded; backpressure stalls the interpreter when
   │                     full (see swarf-gcode's `Interpreter::step` docs)
@@ -72,7 +76,8 @@ design rule, not just a one-off decision in `swarf-gcode`.
 | Crate              | Status      | Tier | Role                                                             |
 | ------------------ | ----------- | ---- | ----------------------------------------------------------------|
 | `swarf-gcode`      | in progress | A    | G-code interpreter: G-code text → ordered motion/command output |
-| `swarf-motion`     | planned     | A    | Trajectory / acceleration planner (the ring-buffer stage)        |
+| `swarf-motion`     | in progress | A    | Trajectory / acceleration planner (the ring-buffer stage) - generic, no G-code dependency |
+| `swarf-bridge`     | in progress | A    | Adapter: `swarf-gcode` output → `swarf-motion`'s plain API       |
 | `swarf-kinematics` | planned     | A/B  | Cartesian / CoreXY / delta / lathe coordinate transforms         |
 | `swarf-step`       | planned     | B    | Step/dir pulse generation and stepper timing                     |
 | `swarf-hal`        | planned     | B    | Board / MCU hardware abstraction                                 |
@@ -169,15 +174,20 @@ cargo run --example trace -- examples/gcode_samples/arc_rword_test.gcode
 ```
 
 There's also a step-through 3D toolpath viewer at
-`swarf-gcode/examples/viewer/`: it interprets a whole program up front, then
-lets you step forward/backward through the resolved output while the
-toolpath draws itself and the source line highlights in sync.
+`swarf-bridge/examples/viewer/`: it interprets a whole program up front,
+runs it through `swarf-motion`'s look-ahead planner (via `swarf-bridge`),
+and lets you step forward/backward - or play it back at physically
+correct, planned speed - through the resolved output while the toolpath
+draws itself and the source line highlights in sync. It lives in
+`swarf-bridge` rather than `swarf-gcode` specifically so it can animate
+using real planned speeds without either of the two lower layers needing
+to depend on the other.
 
-![swarf-gcode viewer stepping through rust_logo.gcode](swarf-gcode/examples/viewer/viewer-screenshot.png)
+![swarf-gcode viewer stepping through rust_logo.gcode](swarf-bridge/examples/viewer/viewer-screenshot.png)
 
 ```bash
-cd swarf-gcode
-cargo run --example viewer -- examples/gcode_samples/rust_logo.gcode
+cd swarf-bridge
+cargo run --example viewer -- ../swarf-gcode/examples/gcode_samples/rust_logo.gcode
 ```
 
 ### Module map
@@ -192,14 +202,18 @@ cargo run --example viewer -- examples/gcode_samples/rust_logo.gcode
 
 ## Status & roadmap
 
-- Builds `no_std`, no heap allocation anywhere, on `gcode` 0.7's
-  zero-allocation visitor API.
-- Passes its full test suite (74 tests + a doctest) on a current Rust
+- `swarf-gcode`, `swarf-motion`, and `swarf-bridge` all build `no_std`, no
+  heap allocation anywhere (`swarf-bridge` and its examples are the only
+  `std`-linked parts, and only because dev-tooling like the viewer needs it).
+- Passes its combined test suite (99 tests + 3 doctests) on a current Rust
   toolchain.
-- Next step: start **`swarf-motion`** (Tier A, the trajectory/planner stage)
-  consuming `swarf-gcode`'s `OutputSink` stream — arc interpolation and
-  canned-cycle-derived move sequencing are deliberately left rich/unflattened
-  in `swarf-gcode` specifically so this layer can own that work.
+- `swarf-motion` implements junction-deviation look-ahead planning
+  (re-derived from grblHAL's `planner.c`, not copied) and chord-tolerance
+  arc tessellation, verified against real files via `swarf-bridge`'s viewer
+  and trace examples.
+- Next step: **`swarf-kinematics`**/**`swarf-step`** (Tier B) - turning
+  `swarf-motion`'s planned entry/nominal/exit speeds into actual per-axis
+  step counts and step-pulse timing.
 
 ## Building
 

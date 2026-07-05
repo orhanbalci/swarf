@@ -184,6 +184,249 @@ fn precompute(
     (entries, statuses, errors.errors)
 }
 
+/// This viewer's assumed machine limits, for planning purposes only -
+/// a real host would supply its own machine's actual settings. Shared
+/// by `plan_motion` (deciding block speeds) and its arc-segment-count
+/// bookkeeping (deciding how many `PlannedBlock`s one arc entry yields).
+fn assumed_limits() -> swarf_motion::MachineLimits<3> {
+    swarf_motion::MachineLimits {
+        axes: [
+            swarf_motion::AxisLimits { max_velocity: 3000.0, max_acceleration: 500.0 },
+            swarf_motion::AxisLimits { max_velocity: 3000.0, max_acceleration: 500.0 },
+            swarf_motion::AxisLimits { max_velocity: 600.0, max_acceleration: 100.0 },
+        ],
+        junction_deviation: 0.01,
+        arc_tolerance: 0.002,
+    }
+}
+
+fn to_motion_position(p: swarf_gcode::Position) -> swarf_motion::Position {
+    swarf_motion::Position { x: p.x, y: p.y, z: p.z }
+}
+
+/// One entry's aggregated speed profile, as if its whole path (arc
+/// segments included) were a single trapezoidal block: real entry speed
+/// (respecting look-ahead cornering into this entry), real nominal
+/// speed, real exit speed (respecting look-ahead cornering OUT of this
+/// entry), and total distance. This is a deliberate simplification for
+/// an arc - which actually tessellates into several individually-planned
+/// sub-blocks with (usually near-identical, since a smooth arc has no
+/// real internal corners) speeds - collapsed into one profile so the
+/// rest of this file can reuse the exact same trapezoid math for both
+/// straight moves and arcs.
+#[derive(Clone, Copy)]
+struct PlannedMotion {
+    entry_speed: f64,
+    nominal_speed: f64,
+    exit_speed: f64,
+    acceleration: f64,
+    distance: f64,
+}
+
+impl PlannedMotion {
+    fn duration_secs(&self) -> f64 {
+        let (v0, vn, v1, a, d) = (self.entry_speed, self.nominal_speed, self.exit_speed, self.acceleration, self.distance);
+        if d <= 0.0 || a <= 0.0 {
+            return 0.0;
+        }
+        let accel_dist = (vn * vn - v0 * v0) / (2.0 * a);
+        let decel_dist = (vn * vn - v1 * v1) / (2.0 * a);
+        if accel_dist + decel_dist <= d {
+            let cruise_dist = d - accel_dist - decel_dist;
+            (vn - v0) / a + cruise_dist / vn + (vn - v1) / a
+        } else {
+            let peak_sqr = (2.0 * a * d + v0 * v0 + v1 * v1) / 2.0;
+            let peak = peak_sqr.max(0.0).sqrt();
+            (peak - v0).max(0.0) / a + (peak - v1).max(0.0) / a
+        }
+    }
+
+    /// Fraction (0.0-1.0) of `distance` covered after `elapsed` seconds -
+    /// the inverse of the timing `duration_secs` implies. Used to
+    /// interpolate the tool marker's on-screen position at physically
+    /// correct (accelerating/cruising/decelerating) speed, rather than
+    /// naive constant-speed-in-time.
+    fn distance_fraction_at(&self, elapsed: f64) -> f64 {
+        let (v0, vn, v1, a, d) = (self.entry_speed, self.nominal_speed, self.exit_speed, self.acceleration, self.distance);
+        if d <= 0.0 {
+            return 1.0;
+        }
+        if a <= 0.0 {
+            return (elapsed / self.duration_secs().max(1e-9)).clamp(0.0, 1.0);
+        }
+
+        let accel_dist = (vn * vn - v0 * v0) / (2.0 * a);
+        let decel_dist = (vn * vn - v1 * v1) / (2.0 * a);
+
+        let pos = if accel_dist + decel_dist <= d {
+            let cruise_dist = d - accel_dist - decel_dist;
+            let t_accel = (vn - v0) / a;
+            let t_cruise = cruise_dist / vn;
+            if elapsed < t_accel {
+                v0 * elapsed + 0.5 * a * elapsed * elapsed
+            } else if elapsed < t_accel + t_cruise {
+                accel_dist + vn * (elapsed - t_accel)
+            } else {
+                let t_decel = (elapsed - t_accel - t_cruise).max(0.0);
+                accel_dist + cruise_dist + (vn * t_decel - 0.5 * a * t_decel * t_decel)
+            }
+        } else {
+            let peak_sqr = (2.0 * a * d + v0 * v0 + v1 * v1) / 2.0;
+            let peak = peak_sqr.max(0.0).sqrt();
+            let t_accel = (peak - v0).max(0.0) / a;
+            let dist_to_peak = (peak * peak - v0 * v0) / (2.0 * a);
+            if elapsed < t_accel {
+                v0 * elapsed + 0.5 * a * elapsed * elapsed
+            } else {
+                let t_decel = (elapsed - t_accel).max(0.0);
+                dist_to_peak + (peak * t_decel - 0.5 * a * t_decel * t_decel)
+            }
+        };
+        (pos / d).clamp(0.0, 1.0)
+    }
+}
+
+/// How many `PlannedBlock`s pushing `output` is expected to produce -
+/// exactly 1 for a `Command` or a straight/rapid move, or however many
+/// segments an arc tessellates into (computed independently here via
+/// the same chord-tolerance formula `Planner::push_arc` uses
+/// internally). Used to keep enough room in the planner queue before
+/// each push (see `plan_motion`) and to slice the flat drained stream
+/// back into per-entry groups.
+fn expected_block_count(output: &LineOutput, arc_tolerance: f64) -> usize {
+    match output {
+        LineOutput::Command(_) => 1,
+        LineOutput::Motion(m) => match m.arc {
+            None => 1,
+            Some(arc) => {
+                let params = swarf_motion::arc::ArcParams::new(
+                    to_motion_position(m.start),
+                    to_motion_position(m.target),
+                    to_motion_position(arc.center),
+                    m.motion_mode == MotionMode::ArcClockwise,
+                );
+                swarf_motion::arc::segment_count(&params, arc_tolerance)
+            }
+        },
+    }
+}
+
+/// Collapse one entry's group of drained `PlannedBlock`s (1 for a
+/// straight move, many for a tessellated arc) into a single
+/// `PlannedMotion` - see that type's doc comment for why this
+/// aggregation is a deliberate simplification for arcs.
+fn aggregate_planned(group: &[swarf_motion::PlannedBlock<Command>]) -> Option<PlannedMotion> {
+    let mut entry_speed = None;
+    let mut nominal_speed = 0.0;
+    let mut exit_speed = 0.0;
+    let mut acceleration = 0.0;
+    let mut distance = 0.0;
+    for block in group {
+        if let swarf_motion::PlannedBlock::Motion {
+            entry_speed: e,
+            nominal_speed: n,
+            exit_speed: x,
+            acceleration: a,
+            distance: d,
+            ..
+        } = block
+        {
+            if entry_speed.is_none() {
+                entry_speed = Some(*e);
+                acceleration = *a;
+            }
+            nominal_speed = *n;
+            exit_speed = *x;
+            distance += *d;
+        }
+    }
+    entry_speed.map(|entry_speed| PlannedMotion {
+        entry_speed,
+        nominal_speed,
+        exit_speed,
+        acceleration,
+        distance,
+    })
+}
+
+/// Run every entry through a `swarf_bridge::GcodePlanner` (this
+/// viewer's one and only integration point with the motion-planning
+/// layer) and collapse the result into one `PlannedMotion` per `Motion`
+/// entry (`None` for `Command` entries), aligned 1:1 with `entries`.
+///
+/// `CAPACITY` is chosen generously (comfortably larger than any single
+/// arc's expected segment count at this viewer's tolerance, for any
+/// realistic file) specifically so a push is never allowed to start
+/// without enough room to complete - `Planner::push_arc` pushes an
+/// arc's tessellated segments one at a time internally, so if it were
+/// to run out of room PARTWAY through an arc, the segments already
+/// pushed couldn't be un-pushed, and simply retrying the whole push
+/// would double-count them. Ensuring room BEFORE each push (by draining
+/// ready entries until there's enough space) sidesteps that entirely
+/// rather than needing transactional/rollback support in `swarf-motion`
+/// itself.
+///
+/// NOTE on the size: `BlockQueue`'s fixed-size array lives on the
+/// stack, not the heap (that's the whole point of `swarf-motion` being
+/// no-alloc) - discovered the hard way that a much larger CAPACITY here
+/// (8192) overflowed a test thread's smaller default stack even though
+/// it ran fine on this app's main thread, since debug builds don't
+/// guarantee eliding the temporary stack copy `Planner::new()` returns
+/// by value. 1024 stays comfortably clear of that while still holding
+/// far more than any single arc in these sample files needs.
+fn plan_motion(entries: &[TraceEntry]) -> Vec<Option<PlannedMotion>> {
+    const CAPACITY: usize = 1024;
+    let limits = assumed_limits();
+    let arc_tolerance = limits.arc_tolerance;
+    let mut planner: swarf_bridge::GcodePlanner<CAPACITY> = swarf_bridge::GcodePlanner::new(limits);
+
+    let expected_counts: Vec<usize> = entries.iter().map(|e| expected_block_count(&e.output, arc_tolerance)).collect();
+
+    // The actual number of blocks produced per entry - equal to
+    // `expected_counts` except for the pathological "skipped" case
+    // below, where it must become 0 so the final slicing pass doesn't
+    // misalign against every entry that follows.
+    let mut actual_counts = expected_counts.clone();
+
+    let mut all_planned = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        let needed = expected_counts[i];
+        if needed > CAPACITY {
+            // Pathological: a single arc alone needs more segments than
+            // the entire buffer (an extremely large radius at a very
+            // tight tolerance). Skip planning it rather than risk a
+            // partial, uncorrectable push - falls back to naive timing
+            // for this one entry.
+            actual_counts[i] = 0;
+            continue;
+        }
+        while CAPACITY - planner.len() < needed {
+            match planner.pop_ready() {
+                Some(p) => all_planned.push(p),
+                None => break,
+            }
+        }
+        let _ = planner.push(entry.output);
+    }
+    while let Some(p) = planner.pop_ready() {
+        all_planned.push(p);
+    }
+
+    let mut result = Vec::with_capacity(entries.len());
+    let mut cursor = 0;
+    for (entry, &count) in entries.iter().zip(&actual_counts) {
+        let end = (cursor + count).min(all_planned.len());
+        let group = &all_planned[cursor..end];
+        cursor = end;
+        result.push(if matches!(entry.output, LineOutput::Motion(_)) {
+            aggregate_planned(group)
+        } else {
+            None
+        });
+    }
+    result
+}
+
 /// Tokenize `line` into `(letter, major, start, end)` words - the
 /// upper-cased letter, the integer part of its number (ignoring any
 /// `.minor` suffix - none of the patterns `highlight_span_for` looks
@@ -581,6 +824,14 @@ struct ViewerApp {
     entries: Vec<TraceEntry>,
     statuses: Vec<ControllerStatus>,
     errors: Vec<(usize, InterpretError)>,
+    /// Real speed profile for each `Motion` entry, from running the
+    /// whole program through `swarf_bridge::GcodePlanner` once at load
+    /// time (see `plan_motion`) - `None` for `Command` entries, or for
+    /// a `Motion` entry the planner couldn't fit (see `plan_motion`'s
+    /// doc comment). Animation timing and tool-position interpolation
+    /// prefer this over the naive feed-rate-only fallback whenever it's
+    /// available.
+    planned: Vec<Option<PlannedMotion>>,
     scene: Scene,
     axis_vertex_count: u32,
     current_step: usize,
@@ -625,6 +876,7 @@ const MIN_FEED_RATE_MM_PER_MIN: f64 = 10.0;
 impl ViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, source: String) -> Self {
         let (entries, statuses, errors) = precompute(&source);
+        let planned = plan_motion(&entries);
         let scene = Scene::build(&entries);
 
         let render_state = cc
@@ -654,6 +906,7 @@ impl ViewerApp {
             entries,
             statuses,
             errors,
+            planned,
             scene,
             axis_vertex_count,
             current_step: 0,
@@ -667,12 +920,20 @@ impl ViewerApp {
     }
 
     /// How long (in simulated seconds) `step`'s motion should take to
-    /// animate, at its own programmed feed rate (or the assumed rapid
-    /// rate for `Rapid` moves) - `0.0` for anything else (a
-    /// non-`Motion` output, or a zero-length move), meaning
-    /// `advance_playback` treats it as instantaneous and moves straight
-    /// on to the next step without consuming any playback time.
+    /// animate. Prefers the REAL trapezoidal duration from
+    /// `swarf_bridge`/`swarf_motion`'s look-ahead planning
+    /// (`self.planned`) - respecting actual acceleration limits and
+    /// cornering into/out of this move - falling back to a naive
+    /// distance-over-feed-rate estimate only when planning wasn't
+    /// available for this entry (see `plan_motion`'s doc comment on
+    /// when that happens). `0.0` for anything else (a non-`Motion`
+    /// output, or a zero-length move), meaning `advance_playback` treats
+    /// it as instantaneous and moves straight on to the next step
+    /// without consuming any playback time.
     fn step_duration_secs(&self, step: usize) -> f32 {
+        if let Some(Some(planned)) = self.planned.get(step) {
+            return planned.duration_secs() as f32;
+        }
         match self.entries.get(step).map(|e| &e.output) {
             Some(LineOutput::Motion(m)) => {
                 let length = geometry::motion_length(m);
@@ -985,7 +1246,25 @@ impl eframe::App for ViewerApp {
                 // coolant/etc., where `progress` is meaningless) fall
                 // back to it unchanged.
                 let animated_position = match self.entries.get(self.current_step).map(|e| &e.output) {
-                    Some(LineOutput::Motion(m)) => geometry::motion_point_at(m, self.progress as f64),
+                    Some(LineOutput::Motion(m)) => {
+                        // `progress` is a fraction of TIME through the
+                        // step's duration - for a real (planned) move
+                        // that's NOT the same as fraction of DISTANCE,
+                        // since the trapezoid accelerates/cruises/
+                        // decelerates rather than moving at constant
+                        // speed. Convert through the real profile when
+                        // available so the marker speeds up/slows down
+                        // correctly instead of moving at naive constant
+                        // velocity across the whole step.
+                        let distance_t = match self.planned.get(self.current_step) {
+                            Some(Some(planned)) => {
+                                let elapsed = self.progress as f64 * planned.duration_secs();
+                                planned.distance_fraction_at(elapsed)
+                            }
+                            _ => self.progress as f64,
+                        };
+                        geometry::motion_point_at(m, distance_t)
+                    }
                     _ => status.state.position,
                 };
                 let tool_position = (self.current_step < self.entries.len()).then_some([

@@ -8,3 +8,27 @@ description = "Thin adapter crate: translates swarf-gcode's resolved output into
 [dependencies]
 swarf-gcode = { path = "../swarf-gcode" }
 swarf-motion = { path = "../swarf-motion" }
+
+[dev-dependencies]
+# examples/viewer: a step-through 3D toolpath viewer animating the full
+# gcode -> planner pipeline. dev-dependencies only affect examples/tests,
+# not the published build.
+#
+# `eframe`'s "wgpu" feature re-exports both `egui_wgpu` and `wgpu`
+# (`eframe::egui_wgpu`, `eframe::wgpu`) already version-matched to what
+# eframe uses internally - depending on ONLY eframe here (rather than
+# also depending on `wgpu`/`egui_wgpu` directly) avoids a real failure
+# mode: `egui_wgpu::CallbackTrait` is implemented against concrete
+# `wgpu` types, so a second, independently-chosen `wgpu` dependency
+# that drifts even a patch version from eframe's internal one fails to
+# compile with confusing "expected wgpu::Device, found wgpu::Device"
+# errors (two distinct crate instances of the same type).
+eframe = { version = "0.31", features = ["wgpu"] }
+bytemuck = { version = "1", features = ["derive"] }
+# TableBuilder for the source-line list - virtualized (only builds
+# visible rows, unlike a plain ScrollArea loop over every line), which
+# matters for real-world files with thousands of lines. Pinned to match
+# eframe's egui version; TableBuilder is pure `egui::Ui` code with no
+# wgpu type boundary, so unlike `eframe`/`wgpu` this isn't a hard
+# version-match requirement, just good hygiene.
+egui_extras = "0.31"
